@@ -1540,3 +1540,107 @@ PY
 else
   fail "--force rereads a Codex rollout rewritten to the same size and mtime in every collector that bills one" "$codex_forced"
 fi
+
+# ------------------------------------- Claude Code and Codex sent to Synthetic
+
+# Synthetic documents Claude Code on its Anthropic-compatible API
+# (ANTHROPIC_BASE_URL=https://api.synthetic.new/anthropic, with hf:org/model
+# ids and syn: aliases as the models) and an OpenAI-compatible one at
+# /openai/v1. Behind that base URL every reply is synthetic's, a Claude-named
+# one too; with no override an hf: or syn: model still is, and a Codex
+# model_providers entry at the host is, whatever its id. The lines are shaped
+# as Claude Code 2.1.308 and Codex 0.163 write them.
+SYNTHETIC_HOME="$WORK/synthetic-routes"
+mkdir -p "$SYNTHETIC_HOME/.codex"
+cat >"$SYNTHETIC_HOME/.codex/config.toml" <<'TOML'
+[model_providers.syn]
+name = "syn"
+base_url = "https://api.synthetic.new/openai/v1"
+TOML
+python3 - "$SYNTHETIC_HOME" "$WORK/synthetic-cells.json" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+home = Path(sys.argv[1])
+stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+# (model, owner with no override, owner behind Synthetic's base URL).
+MODELS = [
+  ("hf:moonshotai/Kimi-K2.5-zs900", "synthetic", "synthetic"),
+  ("syn:large:text-zs901", "synthetic", "synthetic"),
+  ("hf:zai-org/GLM-4.7-Flash-zs902", "synthetic", "synthetic"),
+  ("claude-sonnet-4-5-zs903", "claude", "synthetic"),
+  ("glm-4.6-zs904", "zai", "synthetic"),
+]
+session = "1baa699a-5508-4dc9-bbe8-9b8b236c5300"
+lines, cells = [], []
+for n, (model, bare, routed) in enumerate(MODELS):
+  tokens = 8001234 + 1000 * n
+  prompt = f"894c905e-cd07-4593-946b-c63e9a80{n:04d}"
+  lines.append({"parentUuid": None, "isSidechain": False, "promptId": f"dcabb8e9-c1ea-4e48-a2ce-7a27caa1{n:04d}", "type": "user", "uuid": prompt,
+                "timestamp": stamp, "origin": {"kind": "human"}, "promptSource": "typed", "userType": "external", "entrypoint": "cli",
+                "sessionId": session, "version": "2.1.308", "message": {"role": "user", "content": "go"}})
+  lines.append({"parentUuid": prompt, "isSidechain": False, "requestRef": f"78b6e39e-b112-4b92-a1cb-2489e2f2{n:04d}", "requestedModel": model,
+                "type": "assistant", "uuid": f"da577048-3a3d-4f5e-aed2-0df4c92b{n:04d}", "timestamp": stamp, "userType": "external",
+                "entrypoint": "cli", "sessionId": session, "version": "2.1.308",
+                "message": {"id": f"msg_syn_{n:04d}", "type": "message", "role": "assistant", "model": model, "content": [{"type": "text", "text": "ok"}],
+                            "stop_reason": "end_turn", "usage": {"input_tokens": tokens, "cache_creation_input_tokens": 31, "cache_read_input_tokens": 71,
+                                                                 "output_tokens": 51, "service_tier": "standard"}}})
+  cells.append({"tag": f"zs{900 + n}", "tokens": tokens + 31 + 71 + 51, "owners": [bare, routed]})
+projects = home / ".claude/projects/-home-dhh-proj"
+projects.mkdir(parents=True)
+(projects / f"{session}.jsonl").write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+thread = "01a16375-5c70-7982-8b22-06dc854c1a00"
+usage = {"input_tokens": 8234, "cached_input_tokens": 71, "cache_write_input_tokens": 31, "output_tokens": 51, "reasoning_output_tokens": 0, "total_tokens": 8285}
+rollouts = home / ".codex/sessions" / datetime.now().strftime("%Y/%m/%d")
+rollouts.mkdir(parents=True)
+(rollouts / f"rollout-zs910-{thread}.jsonl").write_text("".join(json.dumps(line) + "\n" for line in [
+  {"timestamp": stamp, "type": "session_meta", "payload": {"session_id": thread, "id": thread, "originator": "codex_exec", "cli_version": "0.163.0", "source": "exec", "thread_source": "user", "model_provider": "syn"}},
+  {"timestamp": stamp, "type": "turn_context", "payload": {"model": "hf:zai-org/GLM-5.3-zs910"}},
+  {"timestamp": stamp, "type": "event_msg", "payload": {"type": "item_completed", "thread_id": thread, "item": {"type": "UserMessage", "id": "u0", "content": [{"type": "text", "text": "go"}]}}},
+  {"timestamp": stamp, "type": "token_usage_record", "payload": {"thread_id": thread, "response_id": "resp_syn_0001", "usage": usage, "thread_token_usage": usage}},
+  {"timestamp": stamp, "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage, "last_token_usage": usage}}},
+]))
+cells.append({"tag": "zs910", "tokens": usage["input_tokens"] + usage["output_tokens"], "owners": ["synthetic", "synthetic"]})
+json.dump(cells, open(sys.argv[2], "w"))
+PY
+run_all "$SYNTHETIC_HOME" "$WORK/synthetic-results-0"
+run_all "$SYNTHETIC_HOME" "$WORK/synthetic-results-1" ANTHROPIC_BASE_URL="https://api.synthetic.new/anthropic"
+
+synthetic_report=$(python3 - "$WORK" "${collectors[@]}" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+work = Path(sys.argv[1])
+cells = json.load(open(work / "synthetic-cells.json"))
+for run, label in enumerate(("with no override", "sent to https://api.synthetic.new/anthropic")):
+  seen = {cell["tag"]: {} for cell in cells}
+  for cid in sys.argv[2:]:
+    try:
+      record = json.loads((work / f"synthetic-results-{run}" / f"{cid}.json").read_text())
+    except ValueError:
+      print(f"{label}: {cid} printed no JSON record")
+      continue
+    for model, bucket in (record.get("modelUsage") or {}).items():
+      total = sum(bucket.get(key) or 0 for key in ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"))
+      for tag in re.findall(r"zs9\d\d", model):
+        if tag in seen and total:
+          seen[tag][cid] = seen[tag].get(cid, 0) + total
+  for cell in cells:
+    tag, owner, tokens = cell["tag"], cell["owners"][run], cell["tokens"]
+    wrong = [f"{cid} counted it {total / tokens:g}x" for cid, total in sorted(seen[tag].items()) if cid != owner or total != tokens]
+    if owner not in seen[tag]:
+      wrong.insert(0, f"{owner} missed it")
+    if wrong:
+      print(f"{tag} {label}, expected {owner}: {'; '.join(wrong)}")
+PY
+)
+if [[ -z $synthetic_report ]]; then
+  pass "Claude Code and Codex set up as Synthetic documents count once, under synthetic"
+else
+  fail "Claude Code and Codex set up as Synthetic documents count once, under synthetic" "$synthetic_report"
+fi

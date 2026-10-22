@@ -1248,9 +1248,9 @@ def scan_opencode(providers: Iterable[str], accept: Accept) -> tuple[list[UsageR
 # Some harnesses send to whatever base URL they are given and record only the
 # model that answered, or a route's name: Claude Code fronts any endpoint
 # ANTHROPIC_BASE_URL names, and a MiniMax Code custom provider any baseURL.
-# Z.ai, Ollama, MiniMax, DeepSeek, Kimi, Alibaba's Model Studio and
-# OpenRouter each document pointing them at their own APIs, so the host says
-# whose tokens those turns are.
+# Z.ai, Ollama, MiniMax, DeepSeek, Kimi, Alibaba's Model Studio, OpenRouter
+# and Synthetic each document pointing them at their own APIs, so the host
+# says whose tokens those turns are.
 
 # The hosts a harness is pointed at in place of its own service, by the
 # collector that bills them. A subdomain of one is the same service.
@@ -1271,6 +1271,8 @@ PROVIDER_HOSTS = {
   "alibabacloud.com": "qwen",
   "qwen.ai": "qwen",
   "openrouter.ai": "openrouter",
+  # Synthetic's Anthropic- and OpenAI-compatible APIs (/anthropic, /openai/v1).
+  "api.synthetic.new": "synthetic",
 }
 
 
@@ -1340,6 +1342,10 @@ CLAUDE_CODE_MODEL_OWNERS = (
   ("deepseek-", "deepseek"),
   ("kimi-", "kimi"),
   ("moonshot", "kimi"),
+  # Synthetic's own naming: Hugging Face ids (hf:org/model) and its aliases
+  # (syn:large:text).
+  ("hf:", "synthetic"),
+  ("syn:", "synthetic"),
 )
 
 
@@ -1376,7 +1382,8 @@ def claude_code_owner(model: Any, base_url: str = "") -> str | None:
   is Anthropic's, through a proxy that may forward to it too. Behind a
   self-hosted base URL anything else ran on the user's own hardware. With no
   override the model's name says whose it was (glm-* is Z.ai's, MiniMax-*
-  MiniMax's, deepseek-* DeepSeek's, kimi-* and moonshot* Kimi's); behind a
+  MiniMax's, deepseek-* DeepSeek's, kimi-* and moonshot* Kimi's, hf:* and
+  syn:* Synthetic's); behind a
   gateway nothing here can place, it could be anyone's, and counts nowhere.
   """
   endpoint = claude_code_endpoint(base_url)
