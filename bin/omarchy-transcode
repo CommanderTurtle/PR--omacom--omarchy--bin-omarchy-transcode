@@ -124,7 +124,7 @@ transcode_picture() {
     esac
     local tmp
     tmp=$(mktemp --suffix=.png)
-    trap 'rm -f "$tmp"' RETURN
+    trap 'rm -f "$tmp" 2>/dev/null; trap - RETURN' RETURN
     ffmpeg -i "$input" -vf "scale='if(gte(iw,ih),min(${max},iw),-1)':'if(gte(iw,ih),-1,min(${max},ih))'" "$tmp" -y
     cwebp -q "$q" -alpha_q 100 -m 6 "$tmp" -o "$output"
     rm -f "$tmp"
@@ -145,7 +145,7 @@ transcode_picture() {
     esac
     local tmp
     tmp=$(mktemp --suffix=.png)
-    trap 'rm -f "$tmp"' RETURN
+    trap 'rm -f "$tmp" 2>/dev/null; trap - RETURN' RETURN
     ffmpeg -i "$input" -vf "scale='if(gte(iw,ih),min(${max},iw),-1)':'if(gte(iw,ih),-1,min(${max},ih))'" "$tmp" -y
     avifenc --codec aom --yuv 444 --min "$q" --max "$q" --qalpha 100 "$tmp" "$output"
     rm -f "$tmp"
@@ -178,8 +178,13 @@ transcode_video() {
     ;;
   esac
 
-  # Only pass a scale filter when there is one; native goes through untouched.
-  [[ -n $scale ]] && vf="-vf $scale"
+  # Pass a scale filter when there is one; on the native path, pad to even
+  # dimensions so libx264 accepts odd inputs (e.g. a cropped VP9 WebM).
+  if [[ -n $scale ]]; then
+    vf="-vf $scale"
+  else
+    vf='-vf pad=ceil(iw/2)*2:ceil(ih/2)*2'
+  fi
 
   case "$format" in
   mp4)
