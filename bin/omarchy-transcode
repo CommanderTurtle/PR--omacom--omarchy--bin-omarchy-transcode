@@ -287,7 +287,10 @@ main() {
       case "$ext" in
       jpg|jpeg) format="jpg" ;;
       png|webp|avif) format="$ext" ;;
-      *) format="jpg" ;;
+      *)
+        # Not a supported output; ask before changing the format.
+        format=$(omarchy-menu-select "$(omarchy-i18n transcode.selectFormat)" jpg png webp avif) || return 1
+        ;;
       esac
     fi
     [[ -n $quality ]] || quality="high"
@@ -298,7 +301,19 @@ main() {
     local quality_explicit=0 resolution_explicit=0
     [[ -n $quality ]] && quality_explicit=1
     [[ -n $resolution ]] && resolution_explicit=1
-    [[ -n $format ]] || format="mp4"
+    if [[ -z $format ]]; then
+      # Resolution-only runs keep the input's container (re-encode, no resize).
+      local ext="${input##*.}"
+      ext="${ext,,}"
+      case "$ext" in
+      mp4|m4v) format="mp4" ;;
+      gif) format="gif" ;;
+      *)
+        # Not a supported output; ask before changing the container.
+        format=$(omarchy-menu-select "$(omarchy-i18n transcode.selectFormat)" mp4 gif) || return 1
+        ;;
+      esac
+    fi
     # No resolution default: keep the source's native size, never upscale.
   fi
   # Picture qualities are words, so the menu shows them in the Omarchy language
