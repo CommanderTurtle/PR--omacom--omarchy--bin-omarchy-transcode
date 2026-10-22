@@ -27,7 +27,6 @@ electricity bill. The agents panel only ever reads the JSON this prints.
 """
 
 import argparse
-import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -42,10 +41,10 @@ sys.path.insert(0, os.path.join(os.environ["OMARCHY_PATH"], "shell", "plugins", 
 from collectors import (  # noqa: E402
   Stats,
   base_record,
-  cache_root,
   cached_scan,
   cloud_model,
   codex_home,
+  codex_rollout_cache,
   codex_provider_urls,
   codex_route_owner,
   codex_rollouts,
@@ -243,18 +242,9 @@ def harness_match():
 # ------------------------------------------------------------------- Codex
 
 
-# Per-file totals of Codex rollouts, kept for the providers this scan counts
-# as local, so a changed local.json or Codex config reads them afresh. An
-# unusable cache root costs the reuse, never the scan.
-def file_cache_path():
-  try:
-    return cache_root() / f"local-codex-files-{scan_digest()}.json"
-  except OSError:
-    return None
-
 
 def scan_codex(stats, use_file_cache):
-  records, complete = codex_rollouts(file_cache_path(), reuse=use_file_cache)
+  records, complete = codex_rollouts(codex_rollout_cache(), reuse=use_file_cache)
   for key, record in records.items():
     if not classifier().provider_is_local(record["provider"]):
       continue
@@ -275,10 +265,6 @@ def scan_sources():
   # Every path the scan reads, and which providers it counts as local, so a
   # changed local.json or Codex config is a new scan rather than a stale one.
   return [Path.home(), codex_home(), opencode_db(), *pi_session_roots(), *routed_sources(), *harness_sources(), json.dumps(classifier().fingerprint())]
-
-
-def scan_digest():
-  return hashlib.sha1("\n".join(map(str, scan_sources())).encode("utf-8")).hexdigest()[:16]
 
 
 def run_local_scans(max_age):
