@@ -1644,3 +1644,160 @@ if [[ -z $synthetic_report ]]; then
 else
   fail "Claude Code and Codex set up as Synthetic documents count once, under synthetic" "$synthetic_report"
 fi
+
+# ----------------------------------------------- prompts no reply answered
+
+# A typed prompt whose request failed, or that got no reply at all, still
+# counts once, under the collector billing the model the session was set to
+# use for it, and holds its session in use: pi and omp write the failed reply
+# with its provider and no usage, opencode the user row with its model. The
+# lines are shaped as pi 1.4.0, omp 18.12.6 and opencode 1.19.3 wrote them
+# against a server refusing the request with a 400. A prompt typed at an
+# untrusted time counts nowhere.
+UNANSWERED_HOME="$WORK/unanswered"
+python3 - "$UNANSWERED_HOME" <<'PY'
+import json
+import sqlite3
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+home = Path(sys.argv[1])
+stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+now_ms = int(time.time() * 1000) - 1000
+runtime = {"version": "18.12.6"}
+zero = {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}}
+
+
+def spent(n):
+  return {"input": 121101 + n, "output": 1251, "cacheRead": 1271, "cacheWrite": 0, "reasoning": 1204, "totalTokens": 123623 + n, "cost": zero["cost"]}
+
+
+def user(n, text, at=None, omp=False):
+  message = {"role": "user", "content": [{"type": "text", "text": text}], "timestamp": now_ms if at is None else at}
+  if omp:
+    message["attribution"] = "user"
+  return {"type": "message", "id": f"u{n}", "timestamp": stamp if at is None else at, "message": message}
+
+
+def reply(n, provider, model, usage):
+  message = {"role": "assistant", "content": [{"type": "text", "text": "" if usage is zero else "hi"}], "api": "openai-completions",
+             "provider": provider, "model": model, "usage": usage, "stopReason": "error" if usage is zero else "stop", "timestamp": now_ms}
+  if usage is zero:
+    message["errorMessage"] = '400: {"message":"refused","type":"invalid_request_error"}'
+  return {"type": "message", "id": f"a{n}", "timestamp": stamp, "message": message}
+
+
+def write(path, lines):
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+
+pi = home / ".pi/agent/sessions/--home-me--"
+omp = home / ".omp/agent/sessions/-"
+# pi: a failed prompt, then an answered one, on Synthetic.
+write(pi / "failed-then-answered.jsonl", [
+  {"type": "session", "version": 3, "id": "s1", "timestamp": stamp, "cwd": "/home/me"},
+  {"type": "model_change", "id": "m1", "parentId": None, "timestamp": stamp, "provider": "synthetic", "modelId": "e2e-failpi"},
+  user(11, "FAILME"), reply(11, "synthetic", "e2e-failpi", zero),
+  user(12, "Say hi"), reply(12, "synthetic", "e2e-failpi", spent(1)),
+])
+# pi: a prompt failed on Z.ai, then the session switched to DeepSeek, which
+# answered the next one: one prompt each.
+write(pi / "failed-then-switched.jsonl", [
+  {"type": "session", "version": 3, "id": "s2", "timestamp": stamp, "cwd": "/home/me"},
+  {"type": "model_change", "id": "m2", "parentId": None, "timestamp": stamp, "provider": "zai", "modelId": "e2e-failzai"},
+  user(21, "FAILME"), reply(21, "zai", "e2e-failzai", zero),
+  {"type": "model_change", "id": "m2b", "parentId": "a21", "timestamp": stamp, "provider": "deepseek", "modelId": "e2e-failswitch"},
+  user(22, "Say hi"), reply(22, "deepseek", "e2e-failswitch", spent(2)),
+])
+# pi: a failed prompt typed at an untrusted time, the session's only one.
+write(pi / "untimed.jsonl", [
+  {"type": "session", "version": 3, "id": "s3", "timestamp": stamp, "cwd": "/home/me"},
+  {"type": "model_change", "id": "m3", "parentId": None, "timestamp": stamp, "provider": "zai", "modelId": "e2e-untimed"},
+  user(31, "FAILME", at=0), reply(31, "zai", "e2e-untimed", zero),
+])
+# omp: a failed prompt, then an answered one, on Z.ai, with a handoff
+# compaction that records no usage.
+write(omp / "failed-then-answered.jsonl", [
+  {"type": "session", "version": 3, "id": "s4", "timestamp": stamp, "cwd": "/home/me"},
+  {"type": "model_change", "id": "m4", "parentId": None, "timestamp": stamp, "runtime": runtime, "model": "zai/e2e-failomp", "resolvedModelIsFallback": False},
+  user(41, "FAILME", omp=True), reply(41, "zai", "e2e-failomp", zero),
+  user(42, "Say hi", omp=True), reply(42, "zai", "e2e-failomp", spent(4)),
+  {"type": "compaction", "id": "c4", "parentId": "a42", "timestamp": stamp, "runtime": runtime, "summary": "s", "firstKeptEntryId": "a42", "tokensBefore": 123929, "tokensAfter": 2054, "method": "handoff"},
+])
+# omp: a prompt on DeepSeek that got no reply at all (the process died), so
+# only the model switch says where it was going.
+write(omp / "no-reply.jsonl", [
+  {"type": "session", "version": 3, "id": "s5", "timestamp": stamp, "cwd": "/home/me"},
+  {"type": "model_change", "id": "m5", "parentId": None, "timestamp": stamp, "runtime": runtime, "model": "deepseek/e2e-noreply", "resolvedModelIsFallback": False},
+  user(51, "hello?", omp=True),
+])
+
+db = home / ".local/share/opencode/opencode.db"
+db.parent.mkdir(parents=True)
+conn = sqlite3.connect(db)
+conn.execute("CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)")
+conn.execute("CREATE TABLE session (id text PRIMARY KEY, parent_id text, title text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL)")
+rows = []
+
+
+def oc_user(session, n, provider, model):
+  rows.append((f"msg_{session}_u{n}", session, now_ms + n, {"role": "user", "time": {"created": now_ms + n}, "agent": "build", "model": {"providerID": provider, "modelID": model}, "summary": {"diffs": []}}))
+
+
+def oc_step(session, n, provider, model, tokens):
+  data = {"parentID": f"msg_{session}_u{n}", "role": "assistant", "mode": "build", "agent": "build", "path": {"cwd": "/home/me", "root": "/"}, "cost": 0,
+          "tokens": tokens, "modelID": model, "providerID": provider, "time": {"created": now_ms + n + 1, "completed": now_ms + n + 2}}
+  if tokens["input"]:
+    data["finish"] = "stop"
+  else:
+    data["error"] = {"name": "APIError", "data": {"message": "refused", "statusCode": 400, "isRetryable": False}}
+  rows.append((f"msg_{session}_a{n}", session, now_ms + n + 1, data))
+
+
+failed = {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}
+answered = {"total": 123827, "input": 121301, "output": 47, "reasoning": 1206, "cache": {"write": 0, "read": 1273}}
+# A failed prompt, then `-c` and an answered one, on Synthetic.
+oc_user("ses_failoc", 1, "synthetic", "oc-failoc")
+oc_step("ses_failoc", 1, "synthetic", "oc-failoc", failed)
+oc_user("ses_failoc", 3, "synthetic", "oc-failoc")
+oc_step("ses_failoc", 3, "synthetic", "oc-failoc", answered)
+# A session holding only a failed prompt, on Z.ai.
+oc_user("ses_failzai", 1, "zai", "oc-failzai")
+oc_step("ses_failzai", 1, "zai", "oc-failzai", failed)
+for session in ("ses_failoc", "ses_failzai"):
+  conn.execute("INSERT INTO session VALUES (?, NULL, 'FAILME', ?, ?)", (session, now_ms - 1000, now_ms - 1000))
+conn.executemany("INSERT INTO message VALUES (?, ?, ?, ?, ?)", [(mid, session, at, at, json.dumps(data)) for mid, session, at, data in rows])
+conn.commit()
+conn.close()
+PY
+run_all "$UNANSWERED_HOME" "$WORK/unanswered-results"
+
+unanswered_report=$(python3 - "$WORK/unanswered-results" "${collectors[@]}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+results = Path(sys.argv[1])
+# (prompts, sessions) each collector must count; every other one counts none.
+expected = {"synthetic": (4, 2), "zai": (4, 3), "deepseek": (2, 2)}
+for cid in sys.argv[2:]:
+  try:
+    record = json.loads((results / f"{cid}.json").read_text())
+  except ValueError:
+    print(f"{cid} printed no JSON record")
+    continue
+  want = expected.get(cid, (0, 0))
+  got = (record.get("totalPrompts"), record.get("totalSessions"))
+  today = (record.get("todayPrompts"), record.get("todaySessions"))
+  if got != want or today != want:
+    print(f"{cid}: prompts and sessions {got} (today {today}), expected {want}")
+PY
+)
+if [[ -z $unanswered_report ]]; then
+  pass "a prompt no reply answered in pi, omp or opencode counts once, under the model its session was set to use"
+else
+  fail "a prompt no reply answered in pi, omp or opencode counts once, under the model its session was set to use" "$unanswered_report"
+fi

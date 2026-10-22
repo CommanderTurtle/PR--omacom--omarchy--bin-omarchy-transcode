@@ -949,6 +949,105 @@ check(
   json.dumps(by_provider),
 )
 
+# A typed prompt no step answered, its request refused as opencode 1.19.3
+# records one (an assistant row with an APIError and no tokens), books
+# itself without tokens on the model its user row names, so a session
+# holding only that still counts. In V2 it books on the failed reply after
+# it, and a message migrated into both stores books once. A compaction's
+# marker, a subagent's prompt, a fork's copy and an untrusted time book none.
+failed_db = work / "failed.db"
+conn = sqlite3.connect(failed_db)
+conn.execute("CREATE TABLE session (id text PRIMARY KEY, parent_id text, time_created integer NOT NULL)")
+conn.execute("CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)")
+conn.execute("CREATE TABLE session_message (id text PRIMARY KEY, session_id text NOT NULL, type text NOT NULL,"
+             " seq integer NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)")
+conn.executemany("INSERT INTO session VALUES (?, ?, ?)", [("ses_fail", None, fork_ms), ("ses_only", None, fork_ms), ("ses_kid", "ses_fail", fork_ms), ("ses_copy", None, now_ms + 50)])
+
+
+def asked(created, provider="demo", **extra):
+  return json.dumps({"role": "user", "time": {"created": created}, "agent": "build", "model": {"providerID": provider, "modelID": "oc-failoc"}, "summary": {"diffs": []}, **extra})
+
+
+def refused(parent, created, **extra):
+  return json.dumps(json.loads(step(parent, 0, created)) | {"error": {"name": "APIError", "data": {"message": "refused", "statusCode": 400}}, **extra})
+
+
+conn.executemany("INSERT INTO message VALUES (?, ?, ?, ?, ?)", [
+  # Refused, then `-c` and answered.
+  ("msg_fu1", "ses_fail", now_ms, now_ms, asked(now_ms)),
+  ("msg_fa1", "ses_fail", now_ms + 1, now_ms + 1, refused("msg_fu1", now_ms + 1)),
+  ("msg_fu2", "ses_fail", now_ms + 2, now_ms + 2, asked(now_ms + 2)),
+  ("msg_fa2", "ses_fail", now_ms + 3, now_ms + 3, step("msg_fu2", 900, now_ms + 3, finish="stop")),
+  # A compaction that failed answers its marker all the same.
+  ("msg_fu3", "ses_fail", now_ms + 4, now_ms + 4, asked(now_ms + 4)),
+  ("msg_fc3", "ses_fail", now_ms + 5, now_ms + 5, refused("msg_fu3", now_ms + 5, mode="compaction", agent="compaction", summary=True)),
+  # A session holding only a refused prompt, and one no reply ever came for.
+  ("msg_ou1", "ses_only", now_ms, now_ms, asked(now_ms)),
+  ("msg_oa1", "ses_only", now_ms + 1, now_ms + 1, refused("msg_ou1", now_ms + 1)),
+  ("msg_ou2", "ses_only", now_ms + 2, now_ms + 2, asked(now_ms + 2)),
+  # Another provider's, a subagent's, a fork's copy, and an untrusted time.
+  ("msg_xu1", "ses_only", now_ms + 3, now_ms + 3, asked(now_ms + 3, provider="other")),
+  ("msg_ku1", "ses_kid", now_ms, now_ms, asked(now_ms)),
+  ("msg_cu1", "ses_copy", now_ms, now_ms, asked(now_ms)),
+  ("msg_zu1", "ses_only", now_ms, now_ms, asked(0)),
+  # Migrated into V2 below under the same ids.
+  ("v2_mu", "ses_moved", now_ms, now_ms, asked(now_ms)),
+  ("v2_ma", "ses_moved", now_ms + 1, now_ms + 1, refused("v2_mu", now_ms + 1)),
+])
+conn.executemany("INSERT INTO session_message VALUES (?, ?, ?, ?, ?, ?, ?)", [
+  ("v2_mu", "ses_moved", "user", 1, now_ms, now_ms, json.dumps({"text": "hi", "time": {"created": now_ms}})),
+  ("v2_ma", "ses_moved", "assistant", 2, now_ms, now_ms, v2("demo", {"input": 0})),
+  ("v2_fu", "ses_v2_fail", "user", 1, now_ms, now_ms, json.dumps({"text": "hi", "time": {"created": now_ms}})),
+  ("v2_fa", "ses_v2_fail", "assistant", 2, now_ms, now_ms, v2("demo", {"input": 0})),
+])
+conn.commit()
+conn.close()
+os.environ["OPENCODE_DB"] = str(failed_db)
+rows, complete = collectors.scan_opencode(["demo"], accept_demo)
+os.environ.pop("OPENCODE_DB")
+booked = sorted((row.session, row.input_tokens, row.prompts) for row in rows if row.prompts or row.input_tokens)
+check(
+  "an opencode prompt no step answered books once, on its user row's model, its session with it",
+  complete and booked == [("opencode:ses_fail", 0, 1), ("opencode:ses_fail", 900, 1), ("opencode:ses_moved", 0, 1), ("opencode:ses_only", 0, 1), ("opencode:ses_only", 0, 1), ("opencode:ses_v2_fail", 0, 1)],
+  json.dumps([row._asdict() for row in rows]),
+)
+
+# pi and omp write a refused request as a reply with its provider and no
+# usage (pi 1.4.0's stopReason "error"), so the prompt books there, without
+# tokens; one no reply came for at all books on the model switch before it.
+failed_root = work / "failed-pi"
+failed_root.mkdir()
+failed_stamp = datetime.fromtimestamp(now_ms / 1000, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+zero_usage = {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0}
+
+
+def pi_reply(n, provider, usage):
+  return {"type": "message", "id": f"a{n}", "timestamp": failed_stamp, "message": {"role": "assistant", "provider": provider, "model": "e2e-failpi", "usage": usage,
+                                                                           "stopReason": "error" if usage is zero_usage else "stop"}}
+
+
+def pi_user(n):
+  return {"type": "message", "id": f"u{n}", "timestamp": failed_stamp, "message": {"role": "user", "content": [{"type": "text", "text": "go"}]}}
+
+
+(failed_root / "failed.jsonl").write_text("".join(json.dumps(line) + "\n" for line in [
+  {"type": "model_change", "id": "m1", "timestamp": failed_stamp, "provider": "demo", "modelId": "e2e-failpi"},
+  pi_user(1), pi_reply(1, "other", zero_usage),
+  pi_user(2), pi_reply(2, "demo", zero_usage),
+  pi_user(3), pi_reply(3, "other", {"input": 40, "output": 1}),
+  {"type": "model_change", "id": "m2", "timestamp": failed_stamp, "provider": "demo", "modelId": "e2e-failpi"},
+  pi_user(4),
+]))
+by_provider = {
+  provider: sorted((row.input_tokens, row.prompts) for row in collectors.scan_pi_sessions(r'"provider"\s*:\s*"' + provider + '"', lambda p, m, e, provider=provider: p == provider, [failed_root])[0])
+  for provider in ("demo", "other")
+}
+check(
+  "a pi prompt no reply answered books on the refused reply, else on the model switch, once",
+  by_provider == {"demo": [(0, 1), (0, 1)], "other": [(0, 1), (40, 1)]},
+  json.dumps(by_provider),
+)
+
 # ------------------------------------------------------------- endpoints
 
 # A base URL's host says who bills what it serves: a provider's own host or

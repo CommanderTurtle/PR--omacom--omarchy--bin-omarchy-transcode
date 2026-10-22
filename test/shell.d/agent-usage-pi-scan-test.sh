@@ -4,9 +4,8 @@
 # each for its own providers, so what one scan parses is paid once per
 # collector on every refresh. A file holding none of a collector's lines
 # must cost it nothing beyond rg's search: its prompts, tool results and
-# compactions are never parsed, and the file is never read again for the
-# model a summary ran on. A count, the same on every machine, rather than a
-# time.
+# compactions are never parsed, and no file is read again for the model a
+# summary ran on. A count, the same on every machine, rather than a time.
 
 set -euo pipefail
 
@@ -90,8 +89,8 @@ write(home / ".omp" / "agent" / "sessions" / "-" / "omp-compacted.jsonl", [
   {"type": "compaction", "id": "ocp", "timestamp": stamp, "runtime": runtime, "summary": "s", "firstKeptEntryId": "ou", "tokensBefore": 900, "usage": usage(700)},
 ])
 
-parsed = {"files": set(), "lines": 0, "reread": set()}
-pi_rows, pi_contexts = collectors._pi_rows, collectors._pi_contexts
+parsed = {"files": set(), "lines": 0}
+pi_rows = collectors._pi_rows
 
 
 def counting_rows(path, lines, accept):
@@ -100,13 +99,7 @@ def counting_rows(path, lines, accept):
   return pi_rows(path, lines, accept)
 
 
-def counting_contexts(path, lines):
-  parsed["reread"].add(Path(path).name)
-  return pi_contexts(path, lines)
-
-
 collectors._pi_rows = counting_rows
-collectors._pi_contexts = counting_contexts
 
 
 def scan(provider):
@@ -117,16 +110,16 @@ def scan(provider):
 
 
 rows, complete = scan("nobody")
-check("a scan for a provider with no sessions parses no line and rereads no file",
-      complete and not rows and not parsed["files"] and not parsed["reread"] and parsed["lines"] == 0, json.dumps({**parsed, "files": sorted(parsed["files"]), "reread": sorted(parsed["reread"])}))
+check("a scan for a provider with no sessions parses no line",
+      complete and not rows and not parsed["files"] and parsed["lines"] == 0, json.dumps({**parsed, "files": sorted(parsed["files"])}))
 
 rows, complete = scan("demo")
 check("a scan parses only the files holding its own lines, the omp switch's included",
-      complete and parsed["files"] == {"mine.jsonl", "omp-compacted.jsonl"} and parsed["reread"] <= {"mine.jsonl", "omp-compacted.jsonl"},
-      json.dumps({"files": sorted(parsed["files"]), "reread": sorted(parsed["reread"])}))
+      complete and parsed["files"] == {"mine.jsonl", "omp-compacted.jsonl"}, json.dumps(sorted(parsed["files"])))
+# The omp prompt no reply answered counts on the switch's model.
 check("its own replies, prompts and compactions still count",
       sorted((row.model, row.input_tokens, row.prompts) for row in rows)
-      == [("demo-model", 1000, 1), ("demo-model", 1001, 0), ("demo-model", 1002, 0), ("omp-model", 700, 0)],
+      == [("demo-model", 1000, 1), ("demo-model", 1001, 0), ("demo-model", 1002, 0), ("omp-model", 0, 1), ("omp-model", 700, 0)],
       json.dumps([row._asdict() for row in rows]))
 
 rows, complete = scan("other1")

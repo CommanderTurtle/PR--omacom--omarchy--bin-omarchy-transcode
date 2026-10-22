@@ -747,6 +747,22 @@ def _pi_line(entry: Any) -> tuple | None:
   return None
 
 
+def _pi_key(entry: dict, timestamp: Any, path: str) -> tuple:
+  """The dedup key of one session line.
+
+  A fork copies its parent's entries with their id and timestamp, so the
+  pair names a message across files; an id alone only within its file. A
+  line without an id has nothing tying it to a copy elsewhere, so it is its
+  own and always counts.
+  """
+  message_id = str(entry.get("id") or "")
+  if message_id and timestamp:
+    return ("entry", message_id, str(timestamp))
+  if message_id:
+    return ("path", path, message_id)
+  return ("line", path, object())
+
+
 def _pi_row(entry: dict, timestamp: Any, path: str, provider: str, model: str, usage: dict, prompts: int) -> tuple[tuple, UsageRow] | None:
   """(dedup key, row) for usage one session line spent, or None."""
   input_tokens = usage_tokens(usage, "input", "inputTokens", "input_tokens")
@@ -765,96 +781,85 @@ def _pi_row(entry: dict, timestamp: Any, path: str, provider: str, model: str, u
   day = local_day(timestamp)
   if day is None:
     return None
-  # A fork copies its parent's entries with their id and timestamp, so the
-  # pair names a message across files; an id alone only within its file. A
-  # line without an id has nothing tying it to a copy elsewhere, so it is
-  # its own and always counts.
-  message_id = str(entry.get("id") or "")
-  if message_id and timestamp:
-    key: tuple = ("entry", message_id, str(timestamp))
-  elif message_id:
-    key = ("path", path, message_id)
-  else:
-    key = ("line", path, object())
-  return key, UsageRow(day, path, provider, model, input_tokens, output_tokens, cache_read, cache_write, prompts)
-
-
-def _pi_contexts(path: str, lines: list[tuple[int, Any]]) -> list[tuple[int, tuple[str, str, dict]]]:
-  """(line number, (provider, model, reference)) for every model switch and
-  reply in a session file, in order.
-
-  rg handed over only the lines on the collector's providers, and a switch
-  to another one would go unseen, so the file itself is read again; it is
-  only needed where a summary is, and those are rare. When it can't be read,
-  the lines rg handed over stand in.
-  """
-  contexts = []
-  try:
-    if not stat.S_ISREG(os.stat(path).st_mode):
-      raise OSError(path)
-    with open(path, encoding="utf-8", errors="replace", newline="\n") as handle:
-      for line_number, raw in enumerate(handle, 1):
-        if '"model_change"' not in raw and '"assistant"' not in raw:
-          continue
-        try:
-          line = _pi_line(json.loads(raw))
-        except ValueError:
-          continue
-        if line is not None and line[0] in ("model", "reply"):
-          contexts.append((line_number, tuple(line[1:4])))
-    return contexts
-  except OSError:
-    pass
-  for line_number, entry in lines:
-    line = _pi_line(entry)
-    if line is not None and line[0] in ("model", "reply"):
-      contexts.append((line_number, tuple(line[1:4])))
-  return contexts
+  return _pi_key(entry, timestamp, path), UsageRow(day, path, provider, model, input_tokens, output_tokens, cache_read, cache_write, prompts)
 
 
 def _pi_rows(path: str, lines: list[tuple[int, Any]], accept: Accept) -> Iterator[tuple[int, tuple, UsageRow]]:
   """(line number, dedup key, row) for each (line number, entry) of one
   session file, in order, that `accept` takes.
 
+  `lines` hold every model switch, user and assistant message in the file.
   Usage with no provider of its own bills the model the session was on: the
   last model switch or reply before it. With neither, nothing says who
   billed it, and it is skipped. A typed prompt is booked on the first reply
   that spent tokens answering it, so tool steps and summaries answer none,
-  and a prompt another provider answered stays with that one. It counts on
-  its own day, not the reply's, and one whose time can't be trusted doesn't
-  count. A file with no user messages at all, as only a writer copying pi's
-  format leaves, keeps a prompt per reply.
+  and a prompt another provider answered stays with that one. One that no
+  reply answered before the next prompt or the file's end (its request
+  failed, or none came) is a row of its own without tokens, on the model
+  the session was set to use for it: the failed reply, which pi and omp
+  write with its provider and no usage, else the last model switch or reply
+  before it; with neither it counts nowhere. A prompt counts on its own day,
+  not the reply's, and one whose time can't be trusted doesn't count. A file
+  with no user messages at all, as only a writer copying pi's format leaves,
+  keeps a prompt per reply.
   """
   parsed = [(line_number, entry, _pi_line(entry)) for line_number, entry in lines]
   typed = any(line == ("prompt",) for _, _, line in parsed)
-  # The day of each typed prompt no reply has answered yet, None for one
-  # whose time can't be trusted.
-  asked: list[str | None] = []
-  contexts = _pi_contexts(path, lines) if any(line and line[0] == "summary" for _, _, line in parsed) else []
+  # The model the session is on, from the last switch or reply.
+  context: tuple | None = None
+  # Each typed prompt no reply has answered yet: (line number, dedup key,
+  # day or None for an untrusted time, the model the session was on).
+  asked: list[tuple[int, tuple, str | None, tuple | None]] = []
+  # The first reply since those prompts that spent nothing: a failed request.
+  failed: tuple | None = None
+
+  def unanswered() -> Iterator[tuple[int, tuple, UsageRow]]:
+    for line_number, key, day, before in asked:
+      target = failed or before
+      if day is None or target is None:
+        continue
+      provider, model, reference = target
+      try:
+        if not accept(provider, model, reference):
+          continue
+      except Exception:
+        continue
+      yield line_number, ("asked", *key), UsageRow(day, path, provider, model, 0, 0, 0, 0, 1)
+
   for line_number, entry, line in parsed:
     try:
-      if line is None or line[0] == "model":
+      if line is None:
         continue
       kind = line[0]
+      if kind == "model":
+        context = tuple(line[1:4])
+        continue
       # The entry's own time, else the message's.
       timestamp = entry.get("timestamp")
       if timestamp is None:
         timestamp = obj(entry.get("message")).get("timestamp")
       if kind == "prompt":
-        asked.append(local_day(timestamp))
+        if failed is not None:
+          yield from unanswered()
+          asked, failed = [], None
+        asked.append((line_number, _pi_key(entry, timestamp, path), local_day(timestamp), context))
         continue
       if kind == "summary":
-        before = [context for number_at, context in contexts if number_at < line_number]
-        if not before:
+        if context is None:
           continue
-        provider, model, reference = before[-1]
+        provider, model, reference = context
         usage = line[1]
       else:
         provider, model, reference, usage = line[1:]
+        if kind == "reply":
+          context = (provider, model, reference)
       counted = _pi_row(entry, timestamp, path, provider, model, obj(usage), int(kind == "reply" and not typed))
-      answered: list[str | None] = []
-      if kind == "reply" and counted is not None:
-        answered, asked = asked, []
+      answered: list[tuple] = []
+      if kind == "reply":
+        if counted is not None:
+          answered, asked, failed = asked, [], None
+        elif asked and failed is None:
+          failed = (provider, model, reference)
       if not accept(provider, model, reference):
         continue
     except Exception:
@@ -865,11 +870,12 @@ def _pi_rows(path: str, lines: list[tuple[int, Any]], accept: Accept) -> Iterato
     key, row = counted
     # Prompts typed on the reply's day ride on its row; one typed on another
     # day is a row of its own there, keyed by the reply that answered it.
-    days = Counter(day for day in answered if day is not None)
+    days = Counter(day for _, _, day, _ in answered if day is not None)
     row = row._replace(prompts=row.prompts + days.pop(row.day, 0))
     yield line_number, key, row
     for day, prompts in sorted(days.items()):
       yield line_number, ("prompt", day, *key), UsageRow(day, path, provider, model, 0, 0, 0, 0, prompts)
+  yield from unanswered()
 
 
 def scan_pi_sessions(pattern: str, accept: Accept, roots: Iterable[Path] | None = None) -> tuple[list[UsageRow], bool]:
@@ -897,10 +903,11 @@ def scan_pi_sessions(pattern: str, accept: Accept, roots: Iterable[Path] | None 
     return [], False
 
   # Usage that names no provider of its own, spent on the session's model,
-  # the prompts the replies answer, and every reply, since one another
-  # provider gave still answers the prompt before it.
-  summary = r'"type"\s*:\s*"(compaction|branch_summary)"|"role"\s*:\s*"toolResult".*"usage"\s*:\s*\{'
-  context = summary + r'|"role"\s*:\s*"(user|assistant)"'
+  # the prompts the replies answer, every reply, since one another provider
+  # gave still answers the prompt before it, and every model switch, which
+  # says whose a summary or a prompt no reply answered is.
+  switch = r'"type"\s*:\s*"model_change"'
+  context = r'"type"\s*:\s*"(compaction|branch_summary)"|"role"\s*:\s*"toolResult".*"usage"\s*:\s*\{|"role"\s*:\s*"(user|assistant)"|' + switch
 
   # (root, path, line) of every counted line, so the rows come back in one
   # order however rg's threads interleave the files.
@@ -972,13 +979,13 @@ def scan_pi_sessions(pattern: str, accept: Accept, roots: Iterable[Path] | None 
   for index, root in enumerate(roots):
     # Only a file holding this collector's lines can hold its rows, so the
     # files are picked first: those with a line `pattern` matches, and those
-    # with usage naming no provider where a model switch `accept` takes says
-    # whose it was (omp names the switch's provider/model, which `pattern`
-    # doesn't see). Every other file's prompts and summaries belong to
-    # another collector, and are never parsed here.
+    # with a model switch `accept` takes, which says whose a summary or an
+    # unanswered prompt there is (omp names the switch's provider/model,
+    # which `pattern` doesn't see). Every other file's prompts and summaries
+    # belong to another collector, and are never parsed here.
     owned = matching_files([os.fsencode(root)], [pattern])
-    summarized = set(matching_files([os.fsencode(root)], [summary])) - set(owned)
-    for _, path, _, entry in match_events(sorted(summarized), [r'"type"\s*:\s*"model_change"']):
+    switched = set(matching_files([os.fsencode(root)], [switch])) - set(owned)
+    for _, path, _, entry in match_events(sorted(switched), [switch]):
       line = _pi_line(entry)
       try:
         if line is not None and line[0] == "model" and accept(*line[1:4]):
@@ -1050,26 +1057,28 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return set()
 
 
-def _opencode_row(session_id: Any, entry: Any, row_type: str, created: Any, accept: Accept) -> UsageRow | None:
+def _opencode_row(session_id: Any, entry: Any, row_type: str, created: Any, accept: Accept, empty: bool = False) -> UsageRow | None:
   # Shared by both message stores. The original `message` table keeps the
   # provider and model at the top level; the V2 `session_message` table nests
   # them under `model` and keeps the role in its `type` column, with a
-  # compaction's tokens spent like any reply's.
-  if not isinstance(entry, dict) or (entry.get("role") or row_type) not in ("assistant", "compaction"):
+  # compaction's tokens spent like any reply's. `empty` keeps a row that
+  # spent nothing, for the prompt it books; a user row is one such.
+  if not isinstance(entry, dict) or (entry.get("role") or row_type) not in (("assistant", "compaction", "user") if empty else ("assistant", "compaction")):
     return None
   nested = obj(entry.get("model"))
   provider = str(entry.get("providerID") or nested.get("providerID") or "")
   model = str(entry.get("modelID") or nested.get("id") or nested.get("modelID") or "")
   if not accept(provider, model, entry):
     return None
-  tokens = obj(entry.get("tokens"))
+  # A user row spent nothing, whatever it claims.
+  tokens = obj(entry.get("tokens")) if entry.get("role") != "user" else {}
   cache = obj(tokens.get("cache"))
   input_tokens = token_count(tokens.get("input"))
   # opencode keeps thinking tokens out of output; both are generated.
   output_tokens = token_count(tokens.get("output")) + token_count(tokens.get("reasoning"))
   cache_read = token_count(cache.get("read"))
   cache_write = token_count(cache.get("write"))
-  if not (input_tokens or output_tokens or cache_read or cache_write):
+  if not (input_tokens or output_tokens or cache_read or cache_write or empty):
     return None
   # The message's own time, else the row's: none at all is today's, and an
   # untrusted one, zero included, skips only this row.
@@ -1115,17 +1124,17 @@ def scan_opencode(providers: Iterable[str], accept: Accept) -> tuple[list[UsageR
   # provider took it, by (session, parentID).
   firsts: dict[tuple[str, str], str] = {}
 
-  def take(message_id: Any, session_id: Any, raw: Any, row_type: str, created: Any, since: Any = None, turn: Any = "") -> None:
+  def take(message_id: Any, session_id: Any, raw: Any, row_type: str, created: Any, since: Any = None, turn: Any = "", empty: bool = False) -> None:
     # `turn` is the prompt the row answers, None for none, or "" to read it
-    # from the row. One row that still fails must not take the scan down
-    # with it.
+    # from the row; `empty` keeps a row that spent nothing, for that prompt.
+    # One row that still fails must not take the scan down with it.
     try:
       entry = json.loads(raw)
       # A copy a fork made predates the session holding it.
       spent_at = number(obj(obj(entry).get("time")).get("created"))
       if spent_at and spent_at < number(since):
         return
-      row = _opencode_row(session_id, entry, row_type, created, accept)
+      row = _opencode_row(session_id, entry, row_type, created, accept, empty)
     except Exception:
       return
     # A migrated message can sit in both stores under the same id.
@@ -1165,9 +1174,9 @@ def scan_opencode(providers: Iterable[str], accept: Accept) -> tuple[list[UsageR
     columns = _table_columns(conn, "session_message") if "session_message" in tables else set()
     if {"id", "session_id", "type", "data"} <= columns and patterns:
       # V2 keeps typed prompts as `user` rows without a model, so each books
-      # the first reply after it in its session; `synthetic` rows are the
-      # ones opencode adds itself. A session without any keeps a prompt per
-      # reply.
+      # the first reply after it in its session, one whose request failed
+      # and spent nothing too; `synthetic` rows are the ones opencode adds
+      # itself. A session without any keeps a prompt per reply.
       asked: set[str] = set()
       replies: set[str] = set()
       order = "seq" if "seq" in columns else "time_created" if "time_created" in columns else ""
@@ -1198,7 +1207,7 @@ def scan_opencode(providers: Iterable[str], accept: Accept) -> tuple[list[UsageR
           turn = None
         else:
           turn = ("message", str(message_id))
-        take(message_id, session_id, raw, str(row_type or ""), time_created, turn=turn)
+        take(message_id, session_id, raw, str(row_type or ""), time_created, turn=turn, empty=turn is not None and str(session_id) in asked)
     columns = _table_columns(conn, "message") if "message" in tables else set()
     if {"session_id", "data"} <= columns and patterns:
       row_id = "m.id" if "id" in columns else "m.rowid"
@@ -1234,6 +1243,62 @@ def scan_opencode(providers: Iterable[str], accept: Accept) -> tuple[list[UsageR
         patterns,
       ):
         take(message_id, session_id, raw, "", None, since)
+      # A typed prompt no step answered (its request failed, or none came)
+      # books itself, without tokens, on the model the user row names, the
+      # one opencode sent it to. A compaction's marker is answered by its
+      # summary, and one in a subagent's session isn't typed.
+      waiting: list[tuple[Any, str, dict]] = []
+      for message_id, session_id, raw, since in conn.execute(
+        f"SELECT {row_id}, m.session_id, m.data, {session_created} FROM {source}"
+        f" WHERE m.data LIKE '%\"role\"%:%\"user\"%' AND ({gate})",
+        patterns,
+      ):
+        try:
+          entry = json.loads(raw)
+          if not isinstance(entry, dict) or entry.get("role") != "user" or str(session_id) in children or (str(session_id), str(message_id)) in firsts:
+            continue
+          typed_at = number(obj(entry.get("time")).get("created"))
+          if typed_at and typed_at < number(since):
+            continue
+        except Exception:
+          continue
+        waiting.append((message_id, str(session_id), entry))
+      if waiting:
+        # The steps that did answer them: a compaction's summary, or a failed
+        # request, whose id V2 may have booked the prompt under already.
+        sessions = sorted({session_id for _, session_id, _ in waiting})
+        steps: dict[tuple[str, str], str] = {}
+        compacted: set[tuple[str, str]] = set()
+        for start in range(0, len(sessions), 500):
+          batch = sessions[start:start + 500]
+          for step_id, session_id, raw in conn.execute(
+            f"SELECT {row_id}, m.session_id, m.data FROM message m WHERE m.session_id IN ({', '.join('?' for _ in batch)})"
+            " AND m.data LIKE '%\"parentID\"%' AND m.data LIKE '%\"role\"%:%\"assistant\"%'"
+            f" ORDER BY {'m.time_created, ' if 'time_created' in columns else ''}CAST({row_id} AS TEXT)",
+            batch,
+          ):
+            try:
+              step = json.loads(raw)
+              key = (str(session_id), str(step.get("parentID")))
+              if step.get("summary") is True or step.get("mode") == "compaction":
+                compacted.add(key)
+              steps.setdefault(key, str(step_id))
+            except Exception:
+              continue
+        for message_id, session_id, entry in waiting:
+          key = (session_id, str(message_id))
+          step_id = steps.get(key, str(message_id))
+          if key in compacted or step_id in seen:
+            continue
+          try:
+            row = _opencode_row(session_id, entry, "user", None, accept, empty=True)
+          except Exception:
+            continue
+          if row is None:
+            continue
+          seen.add(step_id)
+          rows.append(row)
+          turns.append((("asked", session_id, str(message_id)), (0, str(message_id))))
   except sqlite3.Error:
     # Transient lock, schema migration, corruption: the numbers stop here,
     # incomplete.
