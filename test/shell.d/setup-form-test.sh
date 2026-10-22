@@ -70,6 +70,8 @@ printf 'keyboard_xkb_layout=%s\n' "${keyboard_xkb_layout:-}"
 printf 'username=%s\n' "${username:-}"
 printf 'password=%s\n' "${password:-}"
 printf 'password_confirmation=%s\n' "${password_confirmation:-}"
+printf 'full_name=%s\n' "${full_name:-}"
+printf 'email_address=%s\n' "${email_address:-}"
 printf 'hostname=%s\n' "${hostname:-}"
 printf 'timezone=%s\n' "${timezone:-}"
 EOF
@@ -217,6 +219,18 @@ run_prompt omarchy_prompt_password "0:s3cret" "130:"
 assert_status "$OMARCHY_FORM_SIGNAL" "password prompt reports Ctrl+C on the confirmation as the caller's signal"
 assert_returned "password confirmation survives Ctrl+C under set -e"
 pass "password confirmation propagates Esc and Ctrl+C without dying under set -e"
+
+# Identity — both fields are skippable, so empty is an answer and not a cancel
+
+run_prompt omarchy_prompt_identity "0:" "0:"
+assert_status 0 "identity prompt treats empty fields as answers"
+[[ -z $(field full_name) && -z $(field email_address) ]] || fail "identity prompt leaves skipped fields empty"
+pass "identity prompt accepts skipped fields"
+
+run_prompt omarchy_prompt_identity "0:David" "1:"
+assert_status "$OMARCHY_FORM_BACK" "identity prompt reports Esc on the email as back"
+assert_returned "identity prompt survives Esc under set -e"
+pass "identity prompt propagates Esc from its second field"
 
 # Hostname
 

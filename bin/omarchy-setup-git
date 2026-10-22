@@ -19,11 +19,15 @@ set_compose_identity() {
   value=${value//\\/\\\\}
   value=${value//\"/\\\"}
 
+  local file
   [[ -f ~/.XCompose ]] || return 0
+  # Write through a symlink, so a dotfiles-managed ~/.XCompose stays managed.
+  file=$(readlink -f ~/.XCompose)
+
   KEY="<Multi_key> <space> <$key> :" LINE="<Multi_key> <space> <$key> : \"$value\"" \
     awk 'index($0, ENVIRON["KEY"]) == 1 { print ENVIRON["LINE"]; found = 1; next } { print } END { if (!found) print ENVIRON["LINE"] }' \
-    ~/.XCompose >~/.XCompose.new
-  mv ~/.XCompose.new ~/.XCompose
+    "$file" >"$file.new"
+  mv "$file.new" "$file"
 }
 
 if [[ -n ${name//[[:space:]]/} ]]; then
