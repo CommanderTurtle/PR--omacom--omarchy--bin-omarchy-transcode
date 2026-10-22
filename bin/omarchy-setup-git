@@ -1,0 +1,50 @@
+#!/bin/bash
+
+# omarchy:summary=Set the name and email for your git commits, and sign in to GitHub
+
+set -e
+
+name=$(git config --global user.name || true)
+email=$(git config --global user.email || true)
+
+echo "Set the name and email used for your git commits (hit return to skip)."
+echo
+name=$(gum input --value "$name" --placeholder "Your full name" --prompt "Full name> ")
+email=$(gum input --value "$email" --placeholder "you@example.com" --prompt "Email address> ")
+
+# Fill the Compose shortcuts (Compose, Space, n/e) the install used to seed,
+# leaving the rest of a hand-edited ~/.XCompose alone.
+set_compose_identity() {
+  local key=$1 value=$2
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+
+  [[ -f ~/.XCompose ]] || return 0
+  KEY="<Multi_key> <space> <$key> :" LINE="<Multi_key> <space> <$key> : \"$value\"" \
+    awk 'index($0, ENVIRON["KEY"]) == 1 { print ENVIRON["LINE"]; found = 1; next } { print } END { if (!found) print ENVIRON["LINE"] }' \
+    ~/.XCompose >~/.XCompose.new
+  mv ~/.XCompose.new ~/.XCompose
+}
+
+if [[ -n ${name//[[:space:]]/} ]]; then
+  git config --global user.name "$name"
+  set_compose_identity n "$name"
+fi
+
+if [[ -n ${email//[[:space:]]/} ]]; then
+  git config --global user.email "$email"
+  set_compose_identity e "$email"
+fi
+
+if [[ -f ~/.XCompose ]]; then
+  omarchy-restart-xcompose || true
+fi
+
+echo
+if omarchy-cmd-missing gh; then
+  echo "The GitHub CLI (gh) is not installed, so skipping GitHub sign-in."
+elif echo "Checking GitHub sign-in..." && gh auth status >/dev/null 2>&1; then
+  echo "Already signed in to GitHub."
+elif gum confirm "Sign in to GitHub?"; then
+  gh auth login
+fi

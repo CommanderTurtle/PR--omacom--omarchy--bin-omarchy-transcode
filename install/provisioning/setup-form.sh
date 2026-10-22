@@ -20,7 +20,7 @@
 # Callers supply `notice <message> <seconds>` for validation feedback, and set
 # the variables these prompts write: keyboard, keyboard_label,
 # keyboard_input_method, keyboard_xkb_layout, username,
-# password, password_confirmation, full_name, email_address, hostname, timezone.
+# password, password_confirmation, hostname, timezone.
 
 OMARCHY_FORM_BACK=1
 OMARCHY_FORM_SIGNAL=130
@@ -171,16 +171,6 @@ omarchy_prompt_password() {
       notice "Passwords didn't match!" 1
     fi
   done
-}
-
-# Both fields are skippable with Return, so an empty value is a real answer and
-# only Esc/Ctrl+C end the prompt early.
-omarchy_prompt_identity() {
-  local status
-  full_name=$(gum input --placeholder "Used for git authentication (hit return to skip)" --prompt.foreground="#845DF9" --prompt "Full name> ") && status=0 || status=$?
-  ((status == 0)) || return $status
-  email_address=$(gum input --placeholder "Used for git authentication (hit return to skip)" --prompt.foreground="#845DF9" --prompt "Email address> ") && status=0 || status=$?
-  return $status
 }
 
 omarchy_prompt_hostname() {

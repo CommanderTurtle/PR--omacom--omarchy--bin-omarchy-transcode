@@ -638,6 +638,9 @@
   "setup.plugin.remove": {
     "label": "Remove Plugin"
   },
+  "setup.git": {
+    "label": "Git"
+  },
   "setup.security": {
     "label": "Security"
   },
