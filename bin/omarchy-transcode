@@ -28,9 +28,11 @@ Formats:
   GIFs route by output format: picture formats (jpg/png/webp) take the
   picture path; avif and the other video formats take the video path.
 
-Engine (avif/webm/gif):
-  auto: hardware AV1 where the vendor's encoder is usable, cpu otherwise;
-  pass gpu or cpu as a trailing argument to override. mp4 stays cpu.
+Engine (avif/webm):
+  asked when the vendor's hardware AV1 encoder passes a live probe, so a
+  gpu pick always encodes on the GPU; pass gpu or cpu as a trailing
+  argument to override. gif auto-detects the CUDA scale pipeline; mp4 stays
+  cpu.
 
 Quality:
   Pictures: high, medium, low (ignored for png)
@@ -362,9 +364,11 @@ transcode_video() {
   local vfr="-fps_mode passthrough"
   local alpha=0
   input_has_alpha "$input" && alpha=1
-  gpu_enc="" gpu_flags=""
   if [[ $engine == "gpu" ]]; then
-    gpu_av1_setup
+    # Reuse the probe main() ran for the engine ask; probe once.
+    [[ -n $gpu_enc ]] || gpu_av1_setup
+  else
+    gpu_enc="" gpu_flags=""
   fi
   # Hardware AV1 encoders have a minimum frame size (nvenc av1: 256x144).
   # Scale small inputs up proportionally; a no-op at or above the minimum.
@@ -675,22 +679,28 @@ main() {
       resolution=$long
     fi
   fi
-  # Engine: auto-selected, no user-facing selector. Where the vendor's
-  # hardware AV1 encoder is usable, hardware encode; otherwise cpu. mp4 and
-  # pictures never use it. An explicit positional overrides.
+  # Engine: an optional trailing positional. When absent, avif and webm are
+  # offered the hardware path only when the vendor's encoder passes a live
+  # probe, so a "gpu" pick is always honored. gif auto-detects the CUDA
+  # scale pipeline; mp4 and pictures stay cpu. An explicit positional
+  # overrides.
   if [[ -z $engine ]]; then
     engine=cpu
     if [[ $type == "video" ]]; then
       case "$format" in
       avif)
         # Animated images (GIF input) keep their alpha on the CPU path only.
-        if [[ $(file -b --mime-type -- "$input") != "image/gif" ]] && gpu_available; then
-          engine=gpu
+        if [[ $(file -b --mime-type -- "$input") != "image/gif" ]]; then
+          gpu_av1_setup
+          if [[ -n $gpu_enc ]]; then
+            engine=$(omarchy-menu-select "$(omarchy-i18n transcode.engine)" gpu cpu) || return 1
+          fi
         fi
         ;;
       webm)
-        if gpu_available; then
-          engine=gpu
+        gpu_av1_setup
+        if [[ -n $gpu_enc ]]; then
+          engine=$(omarchy-menu-select "$(omarchy-i18n transcode.engine)" gpu cpu) || return 1
         fi
         ;;
       gif)
