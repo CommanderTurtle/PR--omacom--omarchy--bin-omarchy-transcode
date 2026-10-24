@@ -66,8 +66,11 @@ media_type() {
   video/*) echo video ;;
   image/gif)
     # A static GIF is a plain picture; an animated one is an animated
-    # image, routed through the video path.
+    # image. A static one still takes the video path when the caller
+    # explicitly asks for a video output (gif, mp4, webm).
     if (( $(picture_frames "$1") > 1 )); then
+      echo video
+    elif [[ ${2:-} == gif || ${2:-} == mp4 || ${2:-} == webm ]]; then
       echo video
     else
       echo picture
@@ -577,7 +580,7 @@ main() {
   [[ -n $input ]] || return 1
   [[ -f $input ]] || { echo "File not found: $input" >&2; return 1; }
 
-  type=$(media_type "$input")
+  type=$(media_type "$input" "$format")
 
   local -a rungs=()
   local w h long axis frames
