@@ -70,7 +70,7 @@ media_type() {
     # explicitly asks for a video output (gif, mp4, webm).
     if (( $(picture_frames "$1") > 1 )); then
       echo video
-    elif [[ ${2:-} == gif || ${2:-} == mp4 || ${2:-} == webm ]]; then
+    elif [[ ${2:-} == "gif" || ${2:-} == "mp4" || ${2:-} == "webm" ]]; then
       echo video
     else
       echo picture
@@ -395,7 +395,7 @@ transcode_video() {
   # same no-exceptions rule the avif output already uses.
   if (( alpha )) && [[ -n $gpu_enc ]]; then
     gpu_enc="" gpu_flags=""
-    [[ $format == gif ]] && engine=cpu
+    [[ $format == "gif" ]] && engine=cpu
   fi
   # Hardware AV1 encoders have a minimum frame size (nvenc av1: 256x144).
   # A target below it takes the cpu path instead of being upscaled, so
@@ -593,7 +593,7 @@ main() {
   engine="${positional[4]:-}"
   # Slot 3 is quality in the new form, but old callers passed resolution
   # there. If it's not a known quality, treat it as a resolution.
-  if [[ -n $quality && $quality != high && $quality != medium && $quality != low ]]; then
+  if [[ -n $quality && $quality != "high" && $quality != "medium" && $quality != "low" ]]; then
     resolution=$quality
     quality=""
   fi
@@ -754,7 +754,7 @@ main() {
   # picture path (animated webp via magick, first-frame jpg/png); avif and
   # the other video formats keep the video path.
   if [[ $type == "video" ]] && [[ $(file -b --mime-type -- "$input") == "image/gif" ]] \
-    && [[ $format == jpg || $format == png || $format == webp ]]; then
+    && [[ $format == "jpg" || $format == "png" || $format == "webp" ]]; then
     type=picture
     frames=$(picture_frames "$input")
     [[ -n $quality ]] || quality="high"
@@ -806,7 +806,7 @@ main() {
     # the final choice, after any menu, so a no-argument animated input is
     # not rejected on its inferred container before the user can pick
     # webp/avif.
-    if (( frames > 1 )) && [[ $format != webp && $format != avif ]]; then
+    if (( frames > 1 )) && [[ $format != "webp" && $format != "avif" ]]; then
       echo "Animated images can only be transcoded to webp or avif" >&2
       return 1
     fi
