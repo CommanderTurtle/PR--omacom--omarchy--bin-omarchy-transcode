@@ -464,11 +464,11 @@ transcode_video() {
     ;;
   webm)
     if [[ -n $gpu_enc ]]; then
-      ffmpeg -y "${src_in[@]}" $hwvf $vfr -c:v "$gpu_enc" $gpu_flags -pix_fmt yuv420p -c:a libopus -b:a 128k -shortest -f webm "$output"
+      ffmpeg -y "${src_in[@]}" $hwvf $vfr -c:v "$gpu_enc" $gpu_flags -pix_fmt yuv420p -c:a libopus -b:a 128k -f webm "$output"
     else
       local wpix=yuv420p
       (( alpha )) && wpix=yuva420p
-      ffmpeg -y "${src_in[@]}" $vf $vfr -c:v libvpx-vp9 -crf 20 -b:v 0 -deadline good -cpu-used 2 -row-mt 1 -pix_fmt "$wpix" -c:a libopus -b:a 128k -shortest -f webm "$output"
+      ffmpeg -y "${src_in[@]}" $vf $vfr -c:v libvpx-vp9 -crf 20 -b:v 0 -deadline good -cpu-used 2 -row-mt 1 -pix_fmt "$wpix" -c:a libopus -b:a 128k -f webm "$output"
     fi
     ;;
   *)
