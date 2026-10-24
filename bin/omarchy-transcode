@@ -443,7 +443,7 @@ transcode_video() {
     fi
   fi
   if [[ $(file -b --mime-type -- "$input") == "image/avif" ]]; then
-    local tmpdir fc dur avg d t i list
+    local tmpdir fc dur avg d t i list delays per_frame
     tmpdir=$(mktemp -d)
     trap 'rm -rf "$tmpdir" 2>/dev/null; trap - RETURN' RETURN
     magick "$input" -coalesce -type TrueColorMATTE -define png:color-type=6 "$tmpdir/frame_%03d.png"
@@ -458,16 +458,33 @@ transcode_video() {
     dur=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 -- "$input" 2>/dev/null)
     avg=$(awk "BEGIN {d=${dur:-0}; if (d<=0) d=1; printf \"%.3f\", d/$fc}")
     list="$tmpdir/concat.txt"
-    i=0
-    while IFS= read -r t; do
-      if [[ $t =~ ^[0-9]+$ ]] && (( t > 0 )); then
-        d=$(awk "BEGIN {printf \"%.3f\", $t/100}")
-      else
-        d=$avg
-      fi
-      printf "file 'frame_%03d.png'\nduration %s\n" "$i" "$d" >>"$list"
-      i=$(( i + 1 ))
-    done < <(magick identify -format '%T\n' -- "$input" 2>/dev/null)
+    # libheif's per-frame delays are only trustworthy when they agree
+    # with the container total: ffmpeg-written avif carries a 1024cs
+    # placeholder per frame that would stretch playback ~100x. Carry the
+    # real per-frame delays when they reconcile, the uniform container
+    # duration otherwise.
+    delays=$(magick identify -format '%T\n' -- "$input" 2>/dev/null)
+    per_frame=$(awk -v d="$dur" '
+      $1 ~ /^[0-9]+$/ && $1 > 0 { s += $1; n++ }
+      END {
+        print (d + 0 > 0 && n > 0 && s / 100 >= 0.75 * d && s / 100 <= 1.5 * d) ? 1 : 0
+      }' <<<"$delays")
+    if (( per_frame )); then
+      i=0
+      while IFS= read -r t; do
+        if [[ $t =~ ^[0-9]+$ ]] && (( t > 0 )); then
+          d=$(awk "BEGIN {printf \"%.3f\", $t/100}")
+        else
+          d=$avg
+        fi
+        printf "file 'frame_%03d.png'\nduration %s\n" "$i" "$d" >>"$list"
+        i=$(( i + 1 ))
+      done <<<"$delays"
+    else
+      for (( i = 0; i < fc; i++ )); do
+        printf "file 'frame_%03d.png'\nduration %s\n" "$i" "$avg" >>"$list"
+      done
+    fi
     src_in=(-f concat -safe 0 -i "$list")
   fi
 
