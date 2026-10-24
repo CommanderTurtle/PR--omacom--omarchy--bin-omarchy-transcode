@@ -71,8 +71,8 @@ output_path() {
 }
 
 transcode_picture() {
-  local input="$1" format="$2" quality="$3" resolution="$4" output="$5"
-  local resize max q
+  local input="$1" format="$2" quality="$3" resolution="$4" output="$5" frames="$6"
+  local resize max q mq
 
   case "$resolution" in
   high) resize='3160x3160>' max=3160 ;;
@@ -122,6 +122,12 @@ transcode_picture() {
       return 1
       ;;
     esac
+    if (( frames > 1 )); then
+      # Animated input: cwebp encodes from a single-frame temp, so use magick
+      # directly (preserves frames and timing).
+      magick "$input" -coalesce -resize "$resize" -quality "$q" "$output"
+      return 0
+    fi
     local tmp
     tmp=$(mktemp --suffix=.png)
     trap 'rm -f "$tmp" 2>/dev/null; trap - RETURN' RETURN
@@ -143,6 +149,19 @@ transcode_picture() {
       return 1
       ;;
     esac
+    if (( frames > 1 )); then
+      # Animated input: avifenc encodes from a single-frame temp, so use
+      # magick directly (preserves frames and timing). Map the tier to
+      # magick's 0-100 quality scale.
+      case "$quality" in
+      high) mq=90 ;;
+      medium) mq=75 ;;
+      low) mq=60 ;;
+      *) mq=75 ;;
+      esac
+      magick "$input" -coalesce -resize "$resize" -quality "$mq" "$output"
+      return 0
+    fi
     local tmp
     tmp=$(mktemp --suffix=.png)
     trap 'rm -f "$tmp" 2>/dev/null; trap - RETURN' RETURN
@@ -418,7 +437,7 @@ main() {
     copy_to_clipboard "$output"
     omarchy-notification-send -g 󰴑 "$(omarchy-i18n transcode.done "$resolution" "$format")" "$(omarchy-i18n transcode.saved)"
   else
-    transcode_picture "$input" "$format" "$quality" "$resolution" "$output"
+    transcode_picture "$input" "$format" "$quality" "$resolution" "$output" "$frames"
     copy_to_clipboard "$output"
     omarchy-notification-send -g 󰴑 "$(omarchy-i18n transcode.done "$resolution" "$format")" "$(omarchy-i18n transcode.saved)"
   fi
