@@ -516,8 +516,11 @@ transcode_video() {
       # input is encoded by magick (libheif) — the same encoder the picture
       # path uses. Coalesce keeps per-frame delays.
       local mresize=""
-      if [[ -n $scale ]]; then
+      if [[ $scale == scale=-2:* ]]; then
         mresize="-resize x${scale#scale=-2:}"
+      elif [[ $scale == *'if(gte(iw,ih)'* ]]; then
+        # Longest-side target: a shrink-only magick bounding box.
+        mresize="-resize ${resolution}x${resolution}>"
       fi
       magick "$input" -coalesce $mresize -quality 90 "$output"
     else
