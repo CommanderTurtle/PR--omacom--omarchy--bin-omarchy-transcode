@@ -597,6 +597,7 @@ main() {
       gif)
         # A GIF can become a picture or a video; pick, don't assume.
         format=$(omarchy-menu-select "$(omarchy-i18n transcode.selectFormat)" jpg png webp avif gif mp4 webm) || return 1
+        codec_done=1
         ;;
       *)
         # Not a supported output; ask before changing the container.
