@@ -366,7 +366,7 @@ transcode_video() {
   input_has_alpha "$input" && alpha=1
   if [[ $engine == "gpu" ]]; then
     # Reuse the probe main() ran for the engine ask; probe once.
-    [[ -n $gpu_enc ]] || gpu_av1_setup
+    [[ -n ${gpu_enc:-} ]] || gpu_av1_setup
   else
     gpu_enc="" gpu_flags=""
   fi
@@ -376,7 +376,7 @@ transcode_video() {
   if [[ -n $gpu_enc ]]; then
     local minscale='scale=w=trunc(iw*max(1\,max(256/iw\,144/ih))/2)*2:h=trunc(ih*max(1\,max(256/iw\,144/ih))/2)*2'
     if [[ -n $vf ]]; then
-      hwvf="${vf#-vf },$minscale"
+      hwvf="-vf ${vf#-vf },$minscale"
     else
       hwvf="-vf $minscale"
     fi
