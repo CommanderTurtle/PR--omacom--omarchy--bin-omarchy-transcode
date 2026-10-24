@@ -383,14 +383,33 @@ transcode_video() {
     [[ $format == gif ]] && engine=cpu
   fi
   # Hardware AV1 encoders have a minimum frame size (nvenc av1: 256x144).
-  # Scale small inputs up proportionally; a no-op at or above the minimum.
+  # A target below it takes the cpu path instead of being upscaled, so
+  # native stays native and a picked rung is honored.
   local hwvf=""
   if [[ -n $gpu_enc ]]; then
-    local minscale='scale=w=trunc(iw*max(1\,max(256/iw\,144/ih))/2)*2:h=trunc(ih*max(1\,max(256/iw\,144/ih))/2)*2'
-    if [[ -n $vf ]]; then
-      hwvf="-vf ${vf#-vf },$minscale"
+    local iw ih tw th
+    iw=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=noprint_wrappers=1:nokey=1 -- "$input" 2>/dev/null)
+    ih=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=noprint_wrappers=1:nokey=1 -- "$input" 2>/dev/null)
+    if [[ $scale == scale=-2:* ]]; then
+      th=${scale#scale=-2:}
+      if [[ $iw =~ ^[0-9]+$ && $ih =~ ^[0-9]+$ && $th =~ ^[0-9]+$ ]]; then
+        tw=$(( (iw * th) / ih ))
+        (( tw % 2 )) && tw=$(( tw - 1 ))
+      else
+        tw=""
+      fi
     else
-      hwvf="-vf $minscale"
+      tw=$iw th=$ih
+    fi
+    if [[ $tw =~ ^[0-9]+$ && $th =~ ^[0-9]+$ ]] && (( tw >= 256 && th >= 144 )); then
+      local minscale='scale=w=trunc(iw*max(1\,max(256/iw\,144/ih))/2)*2:h=trunc(ih*max(1\,max(256/iw\,144/ih))/2)*2'
+      if [[ -n $vf ]]; then
+        hwvf="-vf ${vf#-vf },$minscale"
+      else
+        hwvf="-vf $minscale"
+      fi
+    else
+      gpu_enc="" gpu_flags=""
     fi
   fi
   if [[ $(file -b --mime-type -- "$input") == "image/avif" ]]; then
