@@ -272,6 +272,7 @@
   "timezone.setTitle": "Set timezone",
   "transcode.codec": "Codec",
   "transcode.done": "Transcoded to %1 %2",
+  "transcode.engine": "Engine",
   "transcode.pickInput": "Transcode picture or video",
   "transcode.qualityHigh": "high",
   "transcode.qualityLow": "low",

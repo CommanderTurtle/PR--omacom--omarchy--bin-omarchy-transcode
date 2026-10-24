@@ -3,7 +3,7 @@
 # omarchy:group=transcode
 # omarchy:name=
 # omarchy:summary=Transcode pictures and videos for sharing
-# omarchy:args=[--path path] [input] [format] [quality] [resolution]
+# omarchy:args=[--path path] [input] [format] [quality] [resolution] [engine]
 # omarchy:examples=omarchy transcode|omarchy transcode --path ~/Downloads|omarchy transcode ~/Videos/demo.mov mp4 '' 1080p|omarchy transcode ~/Pictures/background.heic webp high 4096
 
 set -euo pipefail
@@ -11,7 +11,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  omarchy transcode [--path path] [input] [format] [quality] [resolution]
+  omarchy transcode [--path path] [input] [format] [quality] [resolution] [engine]
 
 With no input, pick a picture or video from ~/Pictures and ~/Videos,
 or only from --path when provided. Then pick one of two split paths:
@@ -24,7 +24,10 @@ Options:
 
 Formats:
   Pictures: jpg, png, webp, avif
-  Videos: mp4, gif
+  Videos: mp4, gif, webm, avif
+
+Engine (animated videos):
+  gpu, cpu (asked when not provided)
 
 Quality:
   Pictures: high, medium, low (ignored for png)
@@ -35,13 +38,41 @@ Resolutions:
 EOF
 }
 
+# Frame count for a picture input: 1 for stills, >1 for animated.
+# AVIF is the only picture format that can animate, and ffprobe's AVIF
+# demuxer exposes only the first frame, so probe without ffmpeg: `file`
+# tags multi-image AVIFs as "Image Sequence", magick counts frames.
+picture_frames() {
+  local desc frames
+  desc=$(file -b -- "$1")
+  if [[ $desc == *"Image Sequence"* ]]; then
+    printf '2'
+    return 0
+  fi
+  frames=$(magick identify -format '%n\n' -- "$1" 2>/dev/null | head -n 4 | wc -l)
+  printf '%s' "$frames"
+}
+
 media_type() {
   local mime
   mime=$(file -b --mime-type "$1")
 
   case "$mime" in
-  image/*) echo picture ;;
   video/*) echo video ;;
+  image/gif)
+    # GIFs are always animated; route them through the video path.
+    echo video
+    ;;
+  image/avif)
+    # AVIF is the one format that can be either: stills take the picture
+    # path, animated ones take the video path.
+    if (( $(picture_frames "$1") > 1 )); then
+      echo video
+    else
+      echo picture
+    fi
+    ;;
+  image/*) echo picture ;;
   *)
     echo "Unsupported file type: $mime" >&2
     return 1
@@ -177,7 +208,7 @@ transcode_picture() {
 }
 
 transcode_video() {
-  local input="$1" format="$2" resolution="$3" output="$4"
+  local input="$1" format="$2" resolution="$3" output="$4" engine="${5:-cpu}"
   local scale vf=""
 
   case "$resolution" in
@@ -197,13 +228,26 @@ transcode_video() {
     ;;
   esac
 
-  # Pass a scale filter when there is one; on the native path, pad to even
-  # dimensions so libx264 accepts odd inputs (e.g. a cropped VP9 WebM).
-  if [[ -n $scale ]]; then
-    vf="-vf $scale"
-  else
-    vf='-vf pad=ceil(iw/2)*2:ceil(ih/2)*2'
-  fi
+  # Animated formats (gif/webm/avif) keep the source frame rate — never
+  # framerate-compress by default — with a lanczos scale. mp4 keeps the
+  # source frame rate and pads to even dimensions so libx264 accepts odd
+  # inputs.
+  case "$format" in
+  gif|webm|avif)
+    if [[ -n $scale ]]; then
+      vf="-vf $scale:flags=lanczos"
+    else
+      vf=""
+    fi
+    ;;
+  *)
+    if [[ -n $scale ]]; then
+      vf="-vf $scale"
+    else
+      vf='-vf pad=ceil(iw/2)*2:ceil(ih/2)*2'
+    fi
+    ;;
+  esac
 
   case "$format" in
   mp4)
@@ -214,10 +258,65 @@ transcode_video() {
     fi
     ;;
   gif)
-    if [[ -n $scale ]]; then
-      ffmpeg -i "$input" -vf "fps=10,$scale:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" "$output"
+    # Two-pass palette: generate a frame-diff palette, then dither against it.
+    local palette='palettegen=max_colors=256:reserve_transparent=1:stats_mode=diff'
+    local use='paletteuse=dither=sierra2_4a:alpha_threshold=128:diff_mode=rectangle'
+    if [[ $engine == gpu ]]; then
+      local sc
+      if [[ -n $scale ]]; then
+        sc="scale_cuda=${scale#scale=}:interp_algo=lanczos:format=yuv420p:passthrough=0"
+      else
+        sc='scale_cuda=iw:ih:format=yuv420p:passthrough=0'
+      fi
+      ffmpeg -hwaccel cuda -hwaccel_output_format cuda -i "$input" \
+        -filter_complex "[0:v]${sc},hwdownload,format=yuv420p,split[v0][v1];[v0]${palette}[p];[v1][p]${use}[out]" \
+        -map "[out]" -an -loop 0 -gifflags +transdiff "$output"
     else
-      ffmpeg -i "$input" -vf "fps=10,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" "$output"
+      ffmpeg -i "$input" \
+        -filter_complex "[0:v]${scale:+$scale:flags=lanczos,}split[v0][v1];[v0]${palette}[p];[v1][p]${use}[out]" \
+        -map "[out]" -an -loop 0 -gifflags +transdiff "$output"
+    fi
+    ;;
+  avif)
+    local in_mime
+    in_mime=$(file -b --mime-type -- "$input")
+    if [[ $in_mime == "image/avif" ]]; then
+      # The avif demuxer reads only the first frame, so route the full
+      # sequence through magick's coalesce (preserves frames + timing),
+      # then re-encode at the target resolution.
+      local tmpdir fc dur fps
+      tmpdir=$(mktemp -d)
+      magick "$input" -coalesce "$tmpdir/frame_%03d.png"
+      fc=$(ls "$tmpdir" | wc -l)
+      if (( fc < 2 )); then
+        # We only get here with a multi-frame source, so a single decoded
+        # frame means the decode failed: fail loudly rather than emit a
+        # 1-frame avif.
+        rm -rf "$tmpdir"
+        echo "Failed to decode all frames of $input" >&2
+        return 1
+      fi
+      dur=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 -- "$input" 2>/dev/null)
+      fps=$(awk "BEGIN {d=${dur:-0}; if (d<=0) d=1; printf \"%.0f\", $fc/d}")
+      if [[ $engine == gpu ]]; then
+        ffmpeg -framerate "$fps" -i "$tmpdir/frame_%03d.png" $vf -an -c:v av1_nvenc -preset p6 -tune hq -rc vbr -cq 17 -b:v 0 -pix_fmt yuv420p -loop 0 -f avif "$output"
+      else
+        ffmpeg -framerate "$fps" -i "$tmpdir/frame_%03d.png" $vf -an -c:v libaom-av1 -crf 20 -b:v 0 -cpu-used 6 -row-mt 1 -pix_fmt yuv420p -loop 0 -f avif "$output"
+      fi
+      rm -rf "$tmpdir"
+    else
+      if [[ $engine == gpu ]]; then
+        ffmpeg -i "$input" $vf -an -c:v av1_nvenc -preset p6 -tune hq -rc vbr -cq 17 -b:v 0 -pix_fmt yuv420p -loop 0 -f avif "$output"
+      else
+        ffmpeg -i "$input" $vf -an -c:v libaom-av1 -crf 20 -b:v 0 -cpu-used 6 -row-mt 1 -still-picture 0 -pix_fmt yuv420p -loop 0 -f avif "$output"
+      fi
+    fi
+    ;;
+  webm)
+    if [[ $engine == gpu ]]; then
+      ffmpeg -i "$input" $vf -c:v av1_nvenc -preset p5 -tune hq -rc vbr -cq 17 -b:v 0 -pix_fmt yuv420p -c:a libopus -b:a 128k -shortest -f webm "$output"
+    else
+      ffmpeg -i "$input" $vf -c:v libvpx-vp9 -crf 20 -b:v 0 -deadline good -cpu-used 2 -row-mt 1 -pix_fmt yuv420p -c:a libopus -b:a 128k -shortest -f webm "$output"
     fi
     ;;
   *)
@@ -271,6 +370,7 @@ main() {
   format="${positional[1]:-}"
   quality="${positional[2]:-}"
   resolution="${positional[3]:-}"
+  engine="${positional[4]:-}"
   # Slot 3 is quality in the new form, but old callers passed resolution
   # there. If it's not a known quality, treat it as a resolution.
   if [[ -n $quality && $quality != high && $quality != medium && $quality != low ]]; then
@@ -294,7 +394,7 @@ main() {
 
   if [[ $type == "picture" ]]; then
     # Frame count: animated (multi-frame) inputs need animated-capable output.
-    frames=$(magick identify -format '%n\n' -- "$input" 2>/dev/null | wc -l)
+    frames=$(picture_frames "$input")
     # Rung ladder: the image's long side, then the standard rungs below it
     # (same ladder as the omafile dialog). Probe the first frame only —
     # a multi-frame identify concatenates per-frame dims and breaks `read`.
@@ -341,9 +441,11 @@ main() {
       case "$ext" in
       mp4|m4v) format="mp4" ;;
       gif) format="gif" ;;
+      webm) format="webm" ;;
+      avif) format="avif" ;;
       *)
         # Not a supported output; ask before changing the container.
-        format=$(omarchy-menu-select "$(omarchy-i18n transcode.selectFormat)" mp4 gif) || return 1
+        format=$(omarchy-menu-select "$(omarchy-i18n transcode.selectFormat)" mp4 gif webm avif) || return 1
         ;;
       esac
     fi
@@ -374,7 +476,7 @@ main() {
         "$low") quality=low ;;
         esac
       else
-        format=$(omarchy-menu-select "$(omarchy-i18n transcode.selectFormat)" mp4 gif) || return 1
+        format=$(omarchy-menu-select "$(omarchy-i18n transcode.selectFormat)" mp4 gif webm avif) || return 1
       fi
       codec_done=1
       [[ $type == "picture" ]] && quality_explicit=1
@@ -409,6 +511,20 @@ main() {
     esac
   fi
 
+  # Engine: an optional trailing positional. When provided, use it directly;
+  # when absent, ask for animated video formats. mp4 and pictures keep the
+  # prior default.
+  if [[ -z $engine ]]; then
+    if [[ $type == "video" ]]; then
+      case "$format" in
+      gif|webm|avif)
+        engine=$(omarchy-menu-select "$(omarchy-i18n transcode.engine)" gpu cpu) || return 1
+        ;;
+      esac
+    fi
+  fi
+  [[ -n $engine ]] || engine=cpu
+
   if [[ $type == "picture" ]]; then
     # Animated pictures can only convert to animated-capable formats. Check
     # the final choice, after any menu, so a no-argument animated input is
@@ -433,7 +549,7 @@ main() {
 
   if [[ $type == "video" ]]; then
     omarchy-notification-send -g 󰴑 "$(omarchy-i18n transcode.working)" "$(omarchy-i18n transcode.workingBody "$(basename -- "$input")" "$format" "$resolution")"
-    transcode_video "$input" "$format" "$resolution" "$output"
+    transcode_video "$input" "$format" "$resolution" "$output" "$engine"
     copy_to_clipboard "$output"
     omarchy-notification-send -g 󰴑 "$(omarchy-i18n transcode.done "$resolution" "$format")" "$(omarchy-i18n transcode.saved)"
   else
