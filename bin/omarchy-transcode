@@ -428,7 +428,7 @@ transcode_video() {
     # Two-pass palette: generate a frame-diff palette, then dither against it.
     local palette='palettegen=max_colors=256:reserve_transparent=1:stats_mode=diff'
     local use='paletteuse=dither=sierra2_4a:alpha_threshold=128:diff_mode=rectangle'
-    if [[ $engine == gpu ]] && [[ $(gpu_vendor) == "nvidia" ]]; then
+    if [[ $engine == "gpu" ]] && [[ $(gpu_vendor) == "nvidia" ]]; then
       local sc
       if [[ -n $scale ]]; then
         sc="scale_cuda=${scale#scale=}:interp_algo=lanczos:format=yuv420p:passthrough=0"
