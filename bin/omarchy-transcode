@@ -341,7 +341,12 @@ transcode_video() {
     return 1
     ;;
   *)
-    scale="scale=-2:$resolution"
+    if [[ $(file -b --mime-type -- "$input") == "image/gif" ]]; then
+      # Gif rungs mean the longest side, matching the picture path.
+      scale="scale='if(gte(iw,ih),min($resolution,iw),-2)':'if(gte(iw,ih),-2,min($resolution,ih))'"
+    else
+      scale="scale=-2:$resolution"
+    fi
     ;;
   esac
 
@@ -403,6 +408,21 @@ transcode_video() {
       if [[ $iw =~ ^[0-9]+$ && $ih =~ ^[0-9]+$ && $th =~ ^[0-9]+$ ]]; then
         tw=$(( (iw * th) / ih ))
         (( tw % 2 )) && tw=$(( tw - 1 ))
+      else
+        tw=""
+      fi
+    elif [[ $scale == *'if(gte(iw,ih)'* ]]; then
+      # Longest-side target (gif rungs): derive w/h from the aspect.
+      if [[ $iw =~ ^[0-9]+$ && $ih =~ ^[0-9]+$ && $resolution =~ ^[0-9]+$ ]] && (( iw > 0 && ih > 0 )); then
+        if (( iw >= ih )); then
+          tw=$resolution
+          th=$(( (resolution * ih) / iw ))
+        else
+          th=$resolution
+          tw=$(( (resolution * iw) / ih ))
+        fi
+        (( tw % 2 )) && tw=$(( tw - 1 ))
+        (( th % 2 )) && th=$(( th - 1 ))
       else
         tw=""
       fi
@@ -690,8 +710,15 @@ main() {
         resolution="${resolution%x}"
       else
         local -a vrungs=()
-        local vh
-        vh=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=noprint_wrappers=1:nokey=1 -- "$input" 2>/dev/null) || vh=""
+        local dims vh
+        if [[ $(file -b --mime-type -- "$input") == "image/gif" ]]; then
+          # Gif rungs mean the longest side, matching the picture path.
+          dims=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 -- "$input" 2>/dev/null) || dims=""
+          IFS=, read -r w h <<<"$dims"
+          vh=$(( ${w:-0} > ${h:-0} ? ${w:-0} : ${h:-0} ))
+        else
+          vh=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=noprint_wrappers=1:nokey=1 -- "$input" 2>/dev/null) || vh=""
+        fi
         if [[ $vh =~ ^[0-9]+$ ]] && (( vh > 0 )); then
           vrungs=("$vh")
           for r in 7168 6656 6144 5632 5120 4608 4096 3840 3584 3072 2560 2160 2048 1920 1440 1280 1080 1024 960 854 720 640 540 512 480 360 256 128; do
