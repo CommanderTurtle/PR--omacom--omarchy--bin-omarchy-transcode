@@ -696,8 +696,9 @@ main() {
     if [[ $type == "video" ]]; then
       case "$format" in
       avif)
-        # Animated images (GIF input) keep their alpha on the CPU path only.
-        if [[ $(file -b --mime-type -- "$input") != "image/gif" ]]; then
+        # Alpha-carrying input keeps its alpha on the CPU path only; the
+        # rest ask for the hardware path when the probe passes.
+        if ! input_has_alpha "$input"; then
           gpu_av1_setup
           if [[ -n $gpu_enc ]]; then
             engine=$(omarchy-menu-select "$(omarchy-i18n transcode.engine)" gpu cpu) || return 1
@@ -718,11 +719,6 @@ main() {
         ;;
       esac
     fi
-  fi
-  # Animated-image AVIF is a CPU path: only it carries alpha. No exceptions,
-  # so an explicit gpu request falls back to cpu here too.
-  if [[ $format == avif ]] && [[ $(file -b --mime-type -- "$input") == "image/gif" ]]; then
-    engine=cpu
   fi
   [[ -n $engine ]] || engine=cpu
 
