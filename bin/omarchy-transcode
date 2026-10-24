@@ -325,8 +325,10 @@ transcode_video() {
   local scale vf=""
   # A fresh marker: ffmpeg exits 0 when the user declines its overwrite
   # prompt, so only a freshly written output proves the encode happened.
+  # The EXIT trap keeps it from leaking on early returns and failures.
   local ref
   ref=$(mktemp)
+  trap 'rm -f "$ref"' EXIT
 
   case "$resolution" in
   "")
@@ -536,8 +538,9 @@ transcode_video() {
     return 1
     ;;
   esac
-  [[ $output -nt $ref ]] || { echo "No output written: $output" >&2; rm -f "$ref"; return 1; }
+  [[ $output -nt $ref ]] || { echo "No output written: $output" >&2; return 1; }
   rm -f "$ref"
+  trap - EXIT
 }
 
 copy_to_clipboard() {
