@@ -109,3 +109,19 @@ read -r out_dur out_frames _ < <(avif_timing "$test_tmp/anim-360.avif")
 awk -v d="$out_dur" 'BEGIN { exit (d >= 1.7 && d <= 2.4) ? 0 : 1 }' \
   || fail "the avif re-encode keeps the input's playback duration" "$out_dur"
 pass "an ffmpeg-written 60fps avif keeps its playback duration through an avif re-encode"
+
+# An avif with real, unequal per-frame delays that reconcile with the
+# container total takes the per-frame delay path; the re-encode keeps
+# every frame.
+magick -size 640x360 xc:green "$test_tmp/a3.png"
+magick -delay 50 "$test_tmp/a1.png" -delay 150 "$test_tmp/a2.png" -delay 100 "$test_tmp/a3.png" "$test_tmp/uneven.avif"
+read -r in_dur in_frames in_tsum < <(avif_timing "$test_tmp/uneven.avif")
+(( in_frames == 3 )) || fail "the uneven-delay avif fixture has 3 frames" "$in_frames"
+awk -v t="$in_tsum" 'BEGIN { exit (t >= 280 && t <= 320) ? 0 : 1 }' \
+  || fail "the uneven-delay avif fixture carries its 50/150/100 delays" "$in_tsum"
+
+run_transcode "$test_tmp/uneven.avif" avif "" 360 cpu >"$test_tmp/t6.log" 2>&1 \
+  || fail "the uneven-delay avif is transcoded" "$(cat "$test_tmp/t6.log")"
+out_frames=$(magick identify -format '%n\n' "$test_tmp/uneven-360.avif" 2>/dev/null | grep -c . || true)
+(( out_frames == 3 )) || fail "the uneven-delay re-encode keeps every frame" "$out_frames"
+pass "an uneven-delay avif re-encode keeps every frame"
