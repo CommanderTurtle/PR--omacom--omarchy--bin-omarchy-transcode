@@ -76,3 +76,36 @@ pass "a picked rung sizes a gif's longest side for gif"
 run_transcode "$test_tmp/alpha.gif" avif 128 >"$test_tmp/t4.log" 2>&1 || fail "a transparent gif encodes to avif at a picked rung" "$(cat "$test_tmp/t4.log")"
 [[ -e $test_tmp/alpha-128.avif ]] || fail "the transparent gif's avif is written"
 pass "a transparent gif encodes to avif at a picked rung"
+
+# --- avif timing regression ------------------------------------------------
+# The ffprobe avif demuxer only exposes the first frame, so the timing
+# probe reads the container duration from ffprobe and the frame count plus
+# per-frame delays (centiseconds) from magick. Use it on any animated avif.
+avif_timing() {
+  local f="$1" dur frames tsum
+  dur=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 -- "$f" 2>/dev/null)
+  frames=$(magick identify -format '%n\n' -- "$f" 2>/dev/null | grep -c . || true)
+  tsum=$(magick identify -format '%T\n' -- "$f" 2>/dev/null | awk '{ s += $1 } END { print s + 0 }')
+  printf '%s %s %s\n' "$dur" "$frames" "$tsum"
+}
+
+# A 2s 60fps avif written by the ffmpeg avif muxer. Its libheif per-frame
+# delays are a placeholder whose sum (~307s) diverges from the container
+# duration (2s), so the re-encode must fall back to the uniform container
+# duration and keep the input's playback time.
+ffmpeg -v error -y -framerate 60 -stream_loop 59 -start_number 1 -i "$test_tmp/a%d.png" \
+  -c:v libaom-av1 -crf 20 -b:v 0 -cpu-used 6 -pix_fmt yuv420p -f avif "$test_tmp/anim.avif"
+
+read -r in_dur in_frames in_tsum < <(avif_timing "$test_tmp/anim.avif")
+(( in_frames == 120 )) || fail "the 60fps avif fixture has 120 frames" "$in_frames"
+awk -v d="$in_dur" 'BEGIN { exit (d >= 1.8 && d <= 2.2) ? 0 : 1 }' || fail "the 60fps avif fixture is ~2s" "$in_dur"
+awk -v d="$in_dur" -v t="$in_tsum" 'BEGIN { exit (d > 0 && t / 100 > 5 * d) ? 0 : 1 }' \
+  || fail "the ffmpeg-written avif's per-frame delays are a placeholder" "dur=$in_dur tsum=$in_tsum"
+
+run_transcode "$test_tmp/anim.avif" avif "" 360 cpu >"$test_tmp/t5.log" 2>&1 \
+  || fail "the 60fps avif is transcoded" "$(cat "$test_tmp/t5.log")"
+read -r out_dur out_frames _ < <(avif_timing "$test_tmp/anim-360.avif")
+(( out_frames == 120 )) || fail "the avif re-encode keeps every frame" "$out_frames"
+awk -v d="$out_dur" 'BEGIN { exit (d >= 1.7 && d <= 2.4) ? 0 : 1 }' \
+  || fail "the avif re-encode keeps the input's playback duration" "$out_dur"
+pass "an ffmpeg-written 60fps avif keeps its playback duration through an avif re-encode"
