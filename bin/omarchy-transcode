@@ -272,7 +272,7 @@ transcode_picture() {
     local tmp
     tmp=$(mktemp --suffix=.png)
     trap 'rm -f "$tmp" 2>/dev/null; trap - RETURN' RETURN
-    ffmpeg -i "$input" -vf "scale='if(gte(iw,ih),min(${max},iw),-1)':'if(gte(iw,ih),-1,min(${max},ih))'" "$tmp" -y
+    ffmpeg -i "$input" -frames:v 1 -vf "scale='if(gte(iw,ih),min(${max},iw),-1)':'if(gte(iw,ih),-1,min(${max},ih))'" "$tmp" -y
     cwebp -q "$q" -alpha_q 100 -m 6 "$tmp" -o "$output"
     rm -f "$tmp"
     ;;
@@ -306,7 +306,7 @@ transcode_picture() {
     local tmp
     tmp=$(mktemp --suffix=.png)
     trap 'rm -f "$tmp" 2>/dev/null; trap - RETURN' RETURN
-    ffmpeg -i "$input" -vf "scale='if(gte(iw,ih),min(${max},iw),-1)':'if(gte(iw,ih),-1,min(${max},ih))'" "$tmp" -y
+    ffmpeg -i "$input" -frames:v 1 -vf "scale='if(gte(iw,ih),min(${max},iw),-1)':'if(gte(iw,ih),-1,min(${max},ih))'" "$tmp" -y
     avifenc --codec aom --yuv 444 --min "$q" --max "$q" --qalpha 100 "$tmp" "$output"
     rm -f "$tmp"
     ;;
