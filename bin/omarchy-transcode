@@ -25,6 +25,8 @@ Options:
 Formats:
   Pictures: jpg, png, webp, avif
   Videos: mp4, gif, webm, avif
+  GIFs route by output format: picture formats take the picture path,
+  video formats take the video path.
 
 Engine (animated videos):
   gpu, cpu (asked when not provided)
@@ -77,6 +79,21 @@ media_type() {
     echo "Unsupported file type: $mime" >&2
     return 1
     ;;
+  esac
+}
+
+# True when the input carries an alpha channel: pixel formats that embed
+# alpha, or a paletted GIF whose first frame has transparency.
+input_has_alpha() {
+  local pix
+  pix=$(ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt \
+    -of default=noprint_wrappers=1:nokey=1 -- "$1" 2>/dev/null) || return 1
+  case "$pix" in
+  yuva* | rgba | bgra | gbrap* | pal8a) return 0 ;;
+  pal8)
+    [[ $(magick identify -format '%A' -- "$1[0]" 2>/dev/null) == "True" ]]
+    ;;
+  *) return 1 ;;
   esac
 }
 
@@ -249,12 +266,51 @@ transcode_video() {
     ;;
   esac
 
+  # Animated AVIF: the avif demuxer reads only the first frame, so decode
+  # the full sequence once — frames plus each frame's own delay — and feed
+  # every encoder from the sequence.
+  local -a src_in=(-i "$input")
+  # Pass the source timestamps through untouched: the avif/webm muxers pick
+  # high-rate timebases, and default CFR resampling would duplicate frames
+  # to fill them (a 10 fps GIF becomes a 100 fps stream of dupes).
+  local vfr="-fps_mode passthrough"
+  local alpha=0
+  input_has_alpha "$input" && alpha=1
+  if [[ $(file -b --mime-type -- "$input") == "image/avif" ]]; then
+    local tmpdir fc dur avg d t i list
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir" 2>/dev/null; trap - RETURN' RETURN
+    magick "$input" -coalesce "$tmpdir/frame_%03d.png"
+    fc=$(ls "$tmpdir" | wc -l)
+    if (( fc < 2 )); then
+      # We only get here with a multi-frame source, so a single decoded
+      # frame means the decode failed: fail loudly rather than emit a
+      # 1-frame output.
+      echo "Failed to decode all frames of $input" >&2
+      return 1
+    fi
+    dur=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 -- "$input" 2>/dev/null)
+    avg=$(awk "BEGIN {d=${dur:-0}; if (d<=0) d=1; printf \"%.3f\", d/$fc}")
+    list="$tmpdir/concat.txt"
+    i=0
+    while IFS= read -r t; do
+      if [[ $t =~ ^[0-9]+$ ]] && (( t > 0 )); then
+        d=$(awk "BEGIN {printf \"%.3f\", $t/100}")
+      else
+        d=$avg
+      fi
+      printf "file 'frame_%03d.png'\nduration %s\n" "$i" "$d" >>"$list"
+      i=$(( i + 1 ))
+    done < <(magick identify -format '%T\n' -- "$input" 2>/dev/null)
+    src_in=(-f concat -safe 0 -i "$list")
+  fi
+
   case "$format" in
   mp4)
     if [[ $resolution == "4k" || $resolution == "2160" ]]; then
-      ffmpeg -i "$input" $vf -c:v libx265 -preset slow -crf 24 -c:a aac -b:a 192k -movflags +faststart "$output"
+      ffmpeg "${src_in[@]}" $vf $vfr -c:v libx265 -preset slow -crf 24 -c:a aac -b:a 192k -movflags +faststart "$output"
     else
-      ffmpeg -i "$input" $vf -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 192k -movflags +faststart "$output"
+      ffmpeg "${src_in[@]}" $vf $vfr -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 192k -movflags +faststart "$output"
     fi
     ;;
   gif)
@@ -268,55 +324,32 @@ transcode_video() {
       else
         sc='scale_cuda=iw:ih:format=yuv420p:passthrough=0'
       fi
-      ffmpeg -hwaccel cuda -hwaccel_output_format cuda -i "$input" \
-        -filter_complex "[0:v]${sc},hwdownload,format=yuv420p,split[v0][v1];[v0]${palette}[p];[v1][p]${use}[out]" \
+      # GIFs decode in software; upload the frames before GPU scaling.
+      ffmpeg -hwaccel cuda -hwaccel_output_format cuda -i "$input" $vfr \
+        -filter_complex "[0:v]hwupload,format=nv12,${sc},hwdownload,format=yuv420p,split[v0][v1];[v0]${palette}[p];[v1][p]${use}[out]" \
         -map "[out]" -an -loop 0 -gifflags +transdiff "$output"
     else
-      ffmpeg -i "$input" \
+      ffmpeg -i "$input" $vfr \
         -filter_complex "[0:v]${scale:+$scale:flags=lanczos,}split[v0][v1];[v0]${palette}[p];[v1][p]${use}[out]" \
         -map "[out]" -an -loop 0 -gifflags +transdiff "$output"
     fi
     ;;
   avif)
-    local in_mime
-    in_mime=$(file -b --mime-type -- "$input")
-    if [[ $in_mime == "image/avif" ]]; then
-      # The avif demuxer reads only the first frame, so route the full
-      # sequence through magick's coalesce (preserves frames + timing),
-      # then re-encode at the target resolution.
-      local tmpdir fc dur fps
-      tmpdir=$(mktemp -d)
-      magick "$input" -coalesce "$tmpdir/frame_%03d.png"
-      fc=$(ls "$tmpdir" | wc -l)
-      if (( fc < 2 )); then
-        # We only get here with a multi-frame source, so a single decoded
-        # frame means the decode failed: fail loudly rather than emit a
-        # 1-frame avif.
-        rm -rf "$tmpdir"
-        echo "Failed to decode all frames of $input" >&2
-        return 1
-      fi
-      dur=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 -- "$input" 2>/dev/null)
-      fps=$(awk "BEGIN {d=${dur:-0}; if (d<=0) d=1; printf \"%.0f\", $fc/d}")
-      if [[ $engine == gpu ]]; then
-        ffmpeg -framerate "$fps" -i "$tmpdir/frame_%03d.png" $vf -an -c:v av1_nvenc -preset p6 -tune hq -rc vbr -cq 17 -b:v 0 -pix_fmt yuv420p -loop 0 -f avif "$output"
-      else
-        ffmpeg -framerate "$fps" -i "$tmpdir/frame_%03d.png" $vf -an -c:v libaom-av1 -crf 20 -b:v 0 -cpu-used 6 -row-mt 1 -pix_fmt yuv420p -loop 0 -f avif "$output"
-      fi
-      rm -rf "$tmpdir"
+    if [[ $engine == gpu ]]; then
+      ffmpeg "${src_in[@]}" $vf $vfr -an -c:v av1_nvenc -preset p6 -tune hq -rc vbr -cq 17 -b:v 0 -pix_fmt yuv420p -loop 0 -f avif "$output"
     else
-      if [[ $engine == gpu ]]; then
-        ffmpeg -i "$input" $vf -an -c:v av1_nvenc -preset p6 -tune hq -rc vbr -cq 17 -b:v 0 -pix_fmt yuv420p -loop 0 -f avif "$output"
-      else
-        ffmpeg -i "$input" $vf -an -c:v libaom-av1 -crf 20 -b:v 0 -cpu-used 6 -row-mt 1 -still-picture 0 -pix_fmt yuv420p -loop 0 -f avif "$output"
-      fi
+      local apix=yuv420p
+      (( alpha )) && apix=yuva444p
+      ffmpeg "${src_in[@]}" $vf $vfr -an -c:v libaom-av1 -crf 20 -b:v 0 -cpu-used 6 -row-mt 1 -pix_fmt "$apix" -loop 0 -f avif "$output"
     fi
     ;;
   webm)
     if [[ $engine == gpu ]]; then
-      ffmpeg -i "$input" $vf -c:v av1_nvenc -preset p5 -tune hq -rc vbr -cq 17 -b:v 0 -pix_fmt yuv420p -c:a libopus -b:a 128k -shortest -f webm "$output"
+      ffmpeg "${src_in[@]}" $vf $vfr -c:v av1_nvenc -preset p5 -tune hq -rc vbr -cq 17 -b:v 0 -pix_fmt yuv420p -c:a libopus -b:a 128k -shortest -f webm "$output"
     else
-      ffmpeg -i "$input" $vf -c:v libvpx-vp9 -crf 20 -b:v 0 -deadline good -cpu-used 2 -row-mt 1 -pix_fmt yuv420p -c:a libopus -b:a 128k -shortest -f webm "$output"
+      local wpix=yuv420p
+      (( alpha )) && wpix=yuva420p
+      ffmpeg "${src_in[@]}" $vf $vfr -c:v libvpx-vp9 -crf 20 -b:v 0 -deadline good -cpu-used 2 -row-mt 1 -pix_fmt "$wpix" -c:a libopus -b:a 128k -shortest -f webm "$output"
     fi
     ;;
   *)
@@ -440,9 +473,12 @@ main() {
       ext="${ext,,}"
       case "$ext" in
       mp4|m4v) format="mp4" ;;
-      gif) format="gif" ;;
       webm) format="webm" ;;
       avif) format="avif" ;;
+      gif)
+        # A GIF can become a picture or a video; pick, don't assume.
+        format=$(omarchy-menu-select "$(omarchy-i18n transcode.selectFormat)" jpg png webp avif gif mp4 webm) || return 1
+        ;;
       *)
         # Not a supported output; ask before changing the container.
         format=$(omarchy-menu-select "$(omarchy-i18n transcode.selectFormat)" mp4 gif webm avif) || return 1
@@ -476,7 +512,11 @@ main() {
         "$low") quality=low ;;
         esac
       else
-        format=$(omarchy-menu-select "$(omarchy-i18n transcode.selectFormat)" mp4 gif webm avif) || return 1
+        if [[ $(file -b --mime-type -- "$input") == "image/gif" ]]; then
+          format=$(omarchy-menu-select "$(omarchy-i18n transcode.selectFormat)" jpg png webp avif gif mp4 webm) || return 1
+        else
+          format=$(omarchy-menu-select "$(omarchy-i18n transcode.selectFormat)" mp4 gif webm avif) || return 1
+        fi
       fi
       codec_done=1
       [[ $type == "picture" ]] && quality_explicit=1
@@ -511,6 +551,21 @@ main() {
     esac
   fi
 
+  # GIFs split by target format: picture formats (jpg/png/webp) take the
+  # picture path (animated webp via magick, first-frame jpg/png); avif and
+  # the other video formats keep the video path.
+  if [[ $type == "video" ]] && [[ $(file -b --mime-type -- "$input") == "image/gif" ]] \
+    && [[ $format == jpg || $format == png || $format == webp ]]; then
+    type=picture
+    frames=$(picture_frames "$input")
+    [[ -n $quality ]] || quality="high"
+    if [[ -z $resolution ]]; then
+      read -r w h <<<"$(magick identify -format '%w %h' -- "$input[0]" 2>/dev/null)" || w="" h=""
+      long=$(( ${w:-0} > ${h:-0} ? ${w:-0} : ${h:-0} ))
+      (( long > 0 )) || long=3160
+      resolution=$long
+    fi
+  fi
   # Engine: an optional trailing positional. When provided, use it directly;
   # when absent, ask for animated video formats. mp4 and pictures keep the
   # prior default.
@@ -518,7 +573,13 @@ main() {
     if [[ $type == "video" ]]; then
       case "$format" in
       gif|webm|avif)
-        engine=$(omarchy-menu-select "$(omarchy-i18n transcode.engine)" gpu cpu) || return 1
+        # The gpu engine is CUDA (av1_nvenc/scale_cuda); on AMD and Intel it
+        # would fail, so only offer it where an NVIDIA GPU is present.
+        if omarchy-hw-nvidia; then
+          engine=$(omarchy-menu-select "$(omarchy-i18n transcode.engine)" gpu cpu) || return 1
+        else
+          engine=cpu
+        fi
         ;;
       esac
     fi
@@ -530,8 +591,8 @@ main() {
     # the final choice, after any menu, so a no-argument animated input is
     # not rejected on its inferred container before the user can pick
     # webp/avif.
-    if (( frames > 1 )) && [[ $format != gif && $format != webp && $format != avif ]]; then
-      echo "Animated images can only be transcoded to gif, webp, or avif" >&2
+    if (( frames > 1 )) && [[ $format != webp && $format != avif ]]; then
+      echo "Animated images can only be transcoded to webp or avif" >&2
       return 1
     fi
     # Stamp only what was actually picked: the resolution rung and/or the
