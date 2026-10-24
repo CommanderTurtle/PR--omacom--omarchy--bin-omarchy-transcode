@@ -328,7 +328,7 @@ transcode_video() {
   # The EXIT trap keeps it from leaking on early returns and failures.
   local ref
   ref=$(mktemp)
-  trap 'rm -f "$ref"' EXIT
+  trap 'rm -f "${ref:-}"' EXIT
 
   case "$resolution" in
   "")
