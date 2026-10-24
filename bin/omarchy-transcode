@@ -375,10 +375,12 @@ transcode_video() {
     gpu_enc="" gpu_flags=""
   fi
   # Hardware AV1 loses alpha on every vendor in this stack (nvenc accepts
-  # alpha input but encodes yuv420p), so alpha inputs take the cpu path —
-  # the same no-exceptions rule the avif output already uses.
+  # alpha input but encodes yuv420p), and the gif scale pipeline forces
+  # yuv420p before the palette — so alpha inputs take the cpu path, the
+  # same no-exceptions rule the avif output already uses.
   if (( alpha )) && [[ -n $gpu_enc ]]; then
     gpu_enc="" gpu_flags=""
+    [[ $format == gif ]] && engine=cpu
   fi
   # Hardware AV1 encoders have a minimum frame size (nvenc av1: 256x144).
   # Scale small inputs up proportionally; a no-op at or above the minimum.
