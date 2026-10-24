@@ -307,11 +307,6 @@ main() {
         ;;
       esac
     fi
-    # Animated pictures can only convert to animated-capable formats.
-    if (( frames > 1 )) && [[ $format != gif && $format != webp && $format != avif ]]; then
-      echo "Animated images can only be transcoded to gif, webp, or avif" >&2
-      return 1
-    fi
     [[ -n $quality ]] || quality="high"
     [[ -n $resolution ]] || resolution="${rungs[0]}"
   else
@@ -396,6 +391,14 @@ main() {
   fi
 
   if [[ $type == "picture" ]]; then
+    # Animated pictures can only convert to animated-capable formats. Check
+    # the final choice, after any menu, so a no-argument animated input is
+    # not rejected on its inferred container before the user can pick
+    # webp/avif.
+    if (( frames > 1 )) && [[ $format != gif && $format != webp && $format != avif ]]; then
+      echo "Animated images can only be transcoded to gif, webp, or avif" >&2
+      return 1
+    fi
     # Stamp only what was actually picked: the resolution rung and/or the
     # quality tier. Defaults (native size, high) stay out of the name.
     stem=""
