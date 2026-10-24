@@ -25,11 +25,11 @@ Options:
 Formats:
   Pictures: jpg, png, webp, avif
   Videos: mp4, gif, webm, avif
-  GIFs route by output format: picture formats take the picture path,
-  video formats take the video path.
+  GIFs route by output format: picture formats (jpg/png/webp) take the
+  picture path; avif and the other video formats take the video path.
 
 Engine (animated videos):
-  gpu, cpu (asked when not provided)
+  gpu (auto-detects the GPU vendor), cpu (asked when not provided)
 
 Quality:
   Pictures: high, medium, low (ignored for png)
@@ -82,19 +82,99 @@ media_type() {
   esac
 }
 
-# True when the input carries an alpha channel: pixel formats that embed
-# alpha, or a paletted GIF whose first frame has transparency.
+# True when the input carries an alpha channel. GIFs are judged by their
+# palette: the gif decoder reports bgra, which would flag every GIF as
+# alpha-carrying.
 input_has_alpha() {
-  local pix
+  local pix a
+  if [[ $(file -b --mime-type -- "$1" 2>/dev/null) == "image/gif" ]]; then
+    a=$(magick identify -format '%A' -- "$1[0]" 2>/dev/null)
+    [[ $a != "Undefined" && $a != "Opaque" ]]
+    return
+  fi
+  if [[ $(file -b --mime-type -- "$1" 2>/dev/null) == "image/avif" ]]; then
+    # The avif demuxer exposes the alpha auxiliary as a separate gray stream.
+    ffprobe -v error -select_streams v -show_entries stream=pix_fmt \
+      -of default=noprint_wrappers=1:nokey=1 -- "$1" 2>/dev/null | grep -qx gray
+    return
+  fi
   pix=$(ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt \
     -of default=noprint_wrappers=1:nokey=1 -- "$1" 2>/dev/null) || return 1
   case "$pix" in
   yuva* | rgba | bgra | gbrap* | pal8a) return 0 ;;
   pal8)
-    [[ $(magick identify -format '%A' -- "$1[0]" 2>/dev/null) == "True" ]]
+    a=$(magick identify -format '%A' -- "$1[0]" 2>/dev/null)
+    [[ $a != "Undefined" && $a != "Opaque" ]]
     ;;
   *) return 1 ;;
   esac
+}
+
+# The GPU vendor with a display device, nvidia preferred over amd over
+# intel on hybrid machines. Empty when no known vendor is present.
+gpu_vendor() {
+  local pci_devices_path="${OMARCHY_PCI_DEVICES_PATH:-/sys/bus/pci/devices}"
+  local device vendors=""
+  for device in "$pci_devices_path"/*; do
+    [[ -e "$device/vendor" ]] || continue
+    [[ $(< "$device/class") == 0x03* ]] || continue
+    case "$( < "$device/vendor")" in
+    0x10de) vendors+="nvidia " ;;
+    0x1002) vendors+="amd " ;;
+    0x8086) vendors+="intel " ;;
+    esac
+  done
+  local v
+  for v in nvidia amd intel; do
+    if [[ $vendors == *"$v"* ]]; then
+      printf '%s' "$v"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# True when a hardware AV1 encoder is compiled in for the detected vendor.
+gpu_available() {
+  local vendor enc
+  vendor=$(gpu_vendor)
+  case "$vendor" in
+  nvidia) enc=av1_nvenc ;;
+  amd) enc=av1_amf ;;
+  intel) enc=av1_qsv ;;
+  *) return 1 ;;
+  esac
+  ffmpeg -hide_banner -encoders 2>/dev/null | grep -qw "$enc"
+}
+
+# Set gpu_enc/gpu_flags to a working hardware AV1 encoder for the detected
+# vendor, probed with a real encode; empty when the encoder is unusable.
+gpu_av1_setup() {
+  gpu_enc="" gpu_flags=""
+  local vendor
+  vendor=$(gpu_vendor)
+  case "$vendor" in
+  nvidia)
+    gpu_enc="av1_nvenc"
+    gpu_flags="-preset p6 -tune hq -rc vbr -cq 17 -b:v 0"
+    ;;
+  amd)
+    gpu_enc="av1_amf"
+    gpu_flags="-quality 17"
+    ;;
+  intel)
+    gpu_enc="av1_qsv"
+    gpu_flags="-global_quality 17"
+    ;;
+  *)
+    return 0
+    ;;
+  esac
+  # The encoder may be compiled in but unusable on this silicon; probe once.
+  ffmpeg -v error -f lavfi -i testsrc=s=256x144:d=0.04 \
+    -c:v "$gpu_enc" $gpu_flags -pix_fmt yuv420p -f null - 2>/dev/null \
+    || { gpu_enc=""; gpu_flags=""; }
+  return 0
 }
 
 output_path() {
@@ -276,6 +356,21 @@ transcode_video() {
   local vfr="-fps_mode passthrough"
   local alpha=0
   input_has_alpha "$input" && alpha=1
+  gpu_enc="" gpu_flags=""
+  if [[ $engine == "gpu" ]]; then
+    gpu_av1_setup
+  fi
+  # Hardware AV1 encoders have a minimum frame size (nvenc av1: 256x144).
+  # Scale small inputs up proportionally; a no-op at or above the minimum.
+  local hwvf=""
+  if [[ -n $gpu_enc ]]; then
+    local minscale='scale=w=trunc(iw*max(1\,max(256/iw\,144/ih))/2)*2:h=trunc(ih*max(1\,max(256/iw\,144/ih))/2)*2'
+    if [[ -n $vf ]]; then
+      hwvf="${vf#-vf },$minscale"
+    else
+      hwvf="-vf $minscale"
+    fi
+  fi
   if [[ $(file -b --mime-type -- "$input") == "image/avif" ]]; then
     local tmpdir fc dur avg d t i list
     tmpdir=$(mktemp -d)
@@ -317,16 +412,17 @@ transcode_video() {
     # Two-pass palette: generate a frame-diff palette, then dither against it.
     local palette='palettegen=max_colors=256:reserve_transparent=1:stats_mode=diff'
     local use='paletteuse=dither=sierra2_4a:alpha_threshold=128:diff_mode=rectangle'
-    if [[ $engine == gpu ]]; then
+    if [[ $engine == gpu ]] && [[ $(gpu_vendor) == "nvidia" ]]; then
       local sc
       if [[ -n $scale ]]; then
         sc="scale_cuda=${scale#scale=}:interp_algo=lanczos:format=yuv420p:passthrough=0"
       else
         sc='scale_cuda=iw:ih:format=yuv420p:passthrough=0'
       fi
-      # GIFs decode in software; upload the frames before GPU scaling.
-      ffmpeg -hwaccel cuda -hwaccel_output_format cuda -i "$input" $vfr \
-        -filter_complex "[0:v]hwupload,format=nv12,${sc},hwdownload,format=yuv420p,split[v0][v1];[v0]${palette}[p];[v1][p]${use}[out]" \
+      # GIFs decode in software; convert to yuv420p, upload the frames
+      # (hwupload_cuda creates its own device context), scale on the GPU.
+      ffmpeg -i "$input" $vfr \
+        -filter_complex "[0:v]format=yuv420p,hwupload_cuda,${sc},hwdownload,format=yuv420p,split[v0][v1];[v0]${palette}[p];[v1][p]${use}[out]" \
         -map "[out]" -an -loop 0 -gifflags +transdiff "$output"
     else
       ffmpeg -i "$input" $vfr \
@@ -335,17 +431,24 @@ transcode_video() {
     fi
     ;;
   avif)
-    if [[ $engine == gpu ]]; then
-      ffmpeg "${src_in[@]}" $vf $vfr -an -c:v av1_nvenc -preset p6 -tune hq -rc vbr -cq 17 -b:v 0 -pix_fmt yuv420p -loop 0 -f avif "$output"
+    if [[ -n $gpu_enc ]]; then
+      ffmpeg "${src_in[@]}" $hwvf $vfr -an -c:v "$gpu_enc" $gpu_flags -pix_fmt yuv420p -loop 0 -f avif "$output"
+    elif (( alpha )); then
+      # The ffmpeg avif muxer drops the alpha auxiliary, so alpha-carrying
+      # input is encoded by magick (libheif) — the same encoder the picture
+      # path uses. Coalesce keeps per-frame delays.
+      local mresize=""
+      if [[ -n $scale ]]; then
+        mresize="-resize x${scale#scale=-2:}"
+      fi
+      magick "$input" -coalesce $mresize -quality 90 "$output"
     else
-      local apix=yuv420p
-      (( alpha )) && apix=yuva444p
-      ffmpeg "${src_in[@]}" $vf $vfr -an -c:v libaom-av1 -crf 20 -b:v 0 -cpu-used 6 -row-mt 1 -pix_fmt "$apix" -loop 0 -f avif "$output"
+      ffmpeg "${src_in[@]}" $vf $vfr -an -c:v libaom-av1 -crf 20 -b:v 0 -cpu-used 6 -row-mt 1 -pix_fmt yuv420p -loop 0 -f avif "$output"
     fi
     ;;
   webm)
-    if [[ $engine == gpu ]]; then
-      ffmpeg "${src_in[@]}" $vf $vfr -c:v av1_nvenc -preset p5 -tune hq -rc vbr -cq 17 -b:v 0 -pix_fmt yuv420p -c:a libopus -b:a 128k -shortest -f webm "$output"
+    if [[ -n $gpu_enc ]]; then
+      ffmpeg "${src_in[@]}" $hwvf $vfr -c:v "$gpu_enc" $gpu_flags -pix_fmt yuv420p -c:a libopus -b:a 128k -shortest -f webm "$output"
     else
       local wpix=yuv420p
       (( alpha )) && wpix=yuva420p
@@ -572,10 +675,18 @@ main() {
   if [[ -z $engine ]]; then
     if [[ $type == "video" ]]; then
       case "$format" in
-      gif|webm|avif)
-        # The gpu engine is CUDA (av1_nvenc/scale_cuda); on AMD and Intel it
-        # would fail, so only offer it where an NVIDIA GPU is present.
-        if omarchy-hw-nvidia; then
+      avif)
+        # Animated images (GIF input) keep their alpha on the CPU path only.
+        if [[ $(file -b --mime-type -- "$input") == "image/gif" ]]; then
+          engine=cpu
+        elif gpu_available; then
+          engine=$(omarchy-menu-select "$(omarchy-i18n transcode.engine)" gpu cpu) || return 1
+        else
+          engine=cpu
+        fi
+        ;;
+      gif|webm)
+        if gpu_available; then
           engine=$(omarchy-menu-select "$(omarchy-i18n transcode.engine)" gpu cpu) || return 1
         else
           engine=cpu
@@ -583,6 +694,11 @@ main() {
         ;;
       esac
     fi
+  fi
+  # Animated-image AVIF is a CPU path: only it carries alpha. No exceptions,
+  # so an explicit gpu request falls back to cpu here too.
+  if [[ $format == avif ]] && [[ $(file -b --mime-type -- "$input") == "image/gif" ]]; then
+    engine=cpu
   fi
   [[ -n $engine ]] || engine=cpu
 
