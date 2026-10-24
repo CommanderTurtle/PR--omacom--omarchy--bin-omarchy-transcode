@@ -65,8 +65,13 @@ media_type() {
   case "$mime" in
   video/*) echo video ;;
   image/gif)
-    # GIFs are always animated; route them through the video path.
-    echo video
+    # A static GIF is a plain picture; an animated one is an animated
+    # image, routed through the video path.
+    if (( $(picture_frames "$1") > 1 )); then
+      echo video
+    else
+      echo picture
+    fi
     ;;
   image/avif)
     # AVIF is the one format that can be either: stills take the picture
@@ -629,9 +634,7 @@ main() {
       webm) format="webm" ;;
       avif) format="avif" ;;
       gif)
-        # A GIF can become a picture or a video; pick, don't assume.
-        format=$(omarchy-menu-select "$(omarchy-i18n transcode.selectFormat)" jpg png webp avif gif mp4 webm) || return 1
-        codec_done=1
+        # An animated GIF is an animated image; the axis menu picks.
         ;;
       *)
         # Not a supported output; ask before changing the container.
@@ -667,7 +670,8 @@ main() {
         esac
       else
         if [[ $(file -b --mime-type -- "$input") == "image/gif" ]]; then
-          format=$(omarchy-menu-select "$(omarchy-i18n transcode.selectFormat)" jpg png webp avif gif mp4 webm) || return 1
+          # Animated images take the animated-image options.
+          format=$(omarchy-menu-select "$(omarchy-i18n transcode.selectFormat)" webp avif) || return 1
         else
           format=$(omarchy-menu-select "$(omarchy-i18n transcode.selectFormat)" mp4 gif webm avif) || return 1
         fi
@@ -703,6 +707,11 @@ main() {
       return 1
       ;;
     esac
+  fi
+  # A gif that took the resolution axis first has no format pick yet:
+  # offer the animated-image options before the picture/video split.
+  if [[ $type == "video" && -z $format ]] && [[ $(file -b --mime-type -- "$input") == "image/gif" ]]; then
+    format=$(omarchy-menu-select "$(omarchy-i18n transcode.selectFormat)" webp avif) || return 1
   fi
 
   # GIFs split by target format: picture formats (jpg/png/webp) take the
