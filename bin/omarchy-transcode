@@ -315,6 +315,10 @@ transcode_picture() {
 transcode_video() {
   local input="$1" format="$2" resolution="$3" output="$4" engine="${5:-cpu}"
   local scale vf=""
+  # A fresh marker: ffmpeg exits 0 when the user declines its overwrite
+  # prompt, so only a freshly written output proves the encode happened.
+  local ref
+  ref=$(mktemp)
 
   case "$resolution" in
   "")
@@ -419,9 +423,9 @@ transcode_video() {
   case "$format" in
   mp4)
     if [[ $resolution == "4k" || $resolution == "2160" ]]; then
-      ffmpeg -y "${src_in[@]}" $vf $vfr -c:v libx265 -preset slow -crf 24 -c:a aac -b:a 192k -movflags +faststart "$output"
+      ffmpeg "${src_in[@]}" $vf $vfr -c:v libx265 -preset slow -crf 24 -c:a aac -b:a 192k -movflags +faststart "$output"
     else
-      ffmpeg -y "${src_in[@]}" $vf $vfr -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 192k -movflags +faststart "$output"
+      ffmpeg "${src_in[@]}" $vf $vfr -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 192k -movflags +faststart "$output"
     fi
     ;;
   gif)
@@ -437,18 +441,18 @@ transcode_video() {
       fi
       # GIFs decode in software; convert to yuv420p, upload the frames
       # (hwupload_cuda creates its own device context), scale on the GPU.
-      ffmpeg -y -i "$input" $vfr \
+      ffmpeg -i "$input" $vfr \
         -filter_complex "[0:v]format=yuv420p,hwupload_cuda,${sc},hwdownload,format=yuv420p,split[v0][v1];[v0]${palette}[p];[v1][p]${use}[out]" \
         -map "[out]" -an -loop 0 -gifflags +transdiff "$output"
     else
-      ffmpeg -y -i "$input" $vfr \
+      ffmpeg -i "$input" $vfr \
         -filter_complex "[0:v]${scale:+$scale:flags=lanczos,}split[v0][v1];[v0]${palette}[p];[v1][p]${use}[out]" \
         -map "[out]" -an -loop 0 -gifflags +transdiff "$output"
     fi
     ;;
   avif)
     if [[ -n $gpu_enc ]]; then
-      ffmpeg -y "${src_in[@]}" $hwvf $vfr -an -c:v "$gpu_enc" $gpu_flags -pix_fmt yuv420p -loop 0 -f avif "$output"
+      ffmpeg "${src_in[@]}" $hwvf $vfr -an -c:v "$gpu_enc" $gpu_flags -pix_fmt yuv420p -loop 0 -f avif "$output"
     elif (( alpha )); then
       # The ffmpeg avif muxer drops the alpha auxiliary, so alpha-carrying
       # input is encoded by magick (libheif) — the same encoder the picture
@@ -459,16 +463,16 @@ transcode_video() {
       fi
       magick "$input" -coalesce $mresize -quality 90 "$output"
     else
-      ffmpeg -y "${src_in[@]}" $vf $vfr -an -c:v libaom-av1 -crf 20 -b:v 0 -cpu-used 6 -row-mt 1 -pix_fmt yuv420p -loop 0 -f avif "$output"
+      ffmpeg "${src_in[@]}" $vf $vfr -an -c:v libaom-av1 -crf 20 -b:v 0 -cpu-used 6 -row-mt 1 -pix_fmt yuv420p -loop 0 -f avif "$output"
     fi
     ;;
   webm)
     if [[ -n $gpu_enc ]]; then
-      ffmpeg -y "${src_in[@]}" $hwvf $vfr -c:v "$gpu_enc" $gpu_flags -pix_fmt yuv420p -c:a libopus -b:a 128k -f webm "$output"
+      ffmpeg "${src_in[@]}" $hwvf $vfr -c:v "$gpu_enc" $gpu_flags -pix_fmt yuv420p -c:a libopus -b:a 128k -f webm "$output"
     else
       local wpix=yuv420p
       (( alpha )) && wpix=yuva420p
-      ffmpeg -y "${src_in[@]}" $vf $vfr -c:v libvpx-vp9 -crf 20 -b:v 0 -deadline good -cpu-used 2 -row-mt 1 -pix_fmt "$wpix" -c:a libopus -b:a 128k -f webm "$output"
+      ffmpeg "${src_in[@]}" $vf $vfr -c:v libvpx-vp9 -crf 20 -b:v 0 -deadline good -cpu-used 2 -row-mt 1 -pix_fmt "$wpix" -c:a libopus -b:a 128k -f webm "$output"
     fi
     ;;
   *)
@@ -476,6 +480,8 @@ transcode_video() {
     return 1
     ;;
   esac
+  [[ $output -nt $ref ]] || { echo "No output written: $output" >&2; rm -f "$ref"; return 1; }
+  rm -f "$ref"
 }
 
 copy_to_clipboard() {
