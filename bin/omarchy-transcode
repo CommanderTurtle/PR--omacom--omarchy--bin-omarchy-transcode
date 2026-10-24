@@ -673,8 +673,8 @@ main() {
         esac
       else
         if [[ $(file -b --mime-type -- "$input") == "image/gif" ]]; then
-          # Animated images take the animated-image options.
-          format=$(omarchy-menu-select "$(omarchy-i18n transcode.selectFormat)" webp avif) || return 1
+          # Animated images take every animated-capable output.
+          format=$(omarchy-menu-select "$(omarchy-i18n transcode.selectFormat)" webp avif gif mp4 webm) || return 1
         else
           format=$(omarchy-menu-select "$(omarchy-i18n transcode.selectFormat)" mp4 gif webm avif) || return 1
         fi
@@ -712,9 +712,9 @@ main() {
     esac
   fi
   # A gif that took the resolution axis first has no format pick yet:
-  # offer the animated-image options before the picture/video split.
+  # offer every animated-capable output before the picture/video split.
   if [[ $type == "video" && -z $format ]] && [[ $(file -b --mime-type -- "$input") == "image/gif" ]]; then
-    format=$(omarchy-menu-select "$(omarchy-i18n transcode.selectFormat)" webp avif) || return 1
+    format=$(omarchy-menu-select "$(omarchy-i18n transcode.selectFormat)" webp avif gif mp4 webm) || return 1
   fi
 
   # GIFs split by target format: picture formats (jpg/png/webp) take the
