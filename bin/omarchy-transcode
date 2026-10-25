@@ -340,6 +340,8 @@ transcode_picture() {
     ;;
   esac
 
+  # Normalize still-image pixels during the existing decode, before metadata
+  # is stripped. -auto-orient is a no-op for untagged/already upright images.
   case "$format" in
   jpg)
     case "$quality" in
@@ -351,10 +353,10 @@ transcode_picture() {
       return 1
       ;;
     esac
-    magick "$input" -resize "$resize" -quality "$q" -strip "$output"
+    magick "$input" -auto-orient -resize "$resize" -quality "$q" -strip "$output"
     ;;
   png)
-    magick "$input" -resize "$resize" -strip -define png:compression-filter=5 \
+    magick "$input" -auto-orient -resize "$resize" -strip -define png:compression-filter=5 \
       -define png:compression-level=9 \
       -define png:compression-strategy=1 \
       -define png:exclude-chunk=all \
@@ -385,7 +387,7 @@ transcode_picture() {
     trap 'rm -f "$tmp" 2>/dev/null; trap - RETURN' RETURN
     # ImageMagick combines AVIF's auxiliary alpha with its color image;
     # ffmpeg's default stream selection decodes only the color plane.
-    magick "$input[0]" -resize "$resize" -type TrueColorAlpha -define png:color-type=6 "$tmp"
+    magick "$input[0]" -auto-orient -resize "$resize" -strip -type TrueColorAlpha -define png:color-type=6 "$tmp"
     cwebp -q "$q" -alpha_q 100 -m 6 "$tmp" -o "$output"
     rm -f "$tmp"
     ;;
@@ -419,7 +421,7 @@ transcode_picture() {
     local tmp
     tmp=$(mktemp --suffix=.png)
     trap 'rm -f "$tmp" 2>/dev/null; trap - RETURN' RETURN
-    magick "$input[0]" -resize "$resize" -type TrueColorAlpha -define png:color-type=6 "$tmp"
+    magick "$input[0]" -auto-orient -resize "$resize" -strip -type TrueColorAlpha -define png:color-type=6 "$tmp"
     avifenc --codec aom --yuv 444 --min "$q" --max "$q" --qalpha 100 "$tmp" "$output"
     rm -f "$tmp"
     ;;

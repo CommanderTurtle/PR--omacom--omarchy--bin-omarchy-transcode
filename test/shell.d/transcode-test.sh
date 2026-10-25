@@ -26,6 +26,54 @@ run_transcode() {
   bash "$ROOT/bin/omarchy-transcode" "$@"
 }
 
+# Camera-style EXIF: asymmetric pixels reveal rotation/mirroring, not just
+# swapped dimensions. Inject a minimal Orientation IFD without a new tool.
+magick -size 120x80 xc:white -fill red -draw 'rectangle 0,0 59,39' \
+  -fill blue -draw 'rectangle 60,0 119,39' -fill green -draw 'rectangle 0,40 59,79' \
+  -quality 100 "$test_tmp/orientation-raw.jpg"
+for tag in 6 2 1 0; do
+  input="$test_tmp/orientation-$tag.jpg"
+  if (( tag )); then
+    {
+      printf '\377\330\377\341\000\042Exif\000\000II\052\000\010\000\000\000\001\000\022\001\003\000\001\000\000\000'
+      printf '%b' "$(printf '\\%03o' "$tag")"
+      printf '\000\000\000\000\000\000\000'
+      tail -c +3 "$test_tmp/orientation-raw.jpg"
+    } >"$input"
+  else
+    cp "$test_tmp/orientation-raw.jpg" "$input"
+  fi
+  before=$(sha256sum "$input")
+  transform=()
+  case "$tag" in
+  6) transform=(-rotate 90) ;;
+  2) transform=(-flop) ;;
+  esac
+  magick "$test_tmp/orientation-raw.jpg" "${transform[@]}" -resize '64x64>' -strip "$test_tmp/orientation-expected.png"
+  expected=$(magick identify -format '%w,%h' "$test_tmp/orientation-expected.png")
+  for format in jpg png webp avif; do
+    run_transcode "$input" "$format" high 64 cpu >"$test_tmp/orientation-$tag-$format.log" 2>&1 \
+      || fail "EXIF orientation $tag exports as $format" "$(cat "$test_tmp/orientation-$tag-$format.log")"
+    output="$test_tmp/orientation-$tag-64-high.$format"
+    actual=$(magick identify -format '%w,%h' "$output[0]")
+    [[ $actual == "$expected" ]] || fail "EXIF orientation $tag is applied before $format resizing" "$actual (expected $expected)"
+    error=$(magick compare -metric RMSE "$test_tmp/orientation-expected.png" "$output[0]" null: 2>&1 || true)
+    error=$(awk -F '[()]' '{ print $2 }' <<<"$error")
+    awk -v e="$error" 'BEGIN { exit (e != "" && e + 0 < 0.04) ? 0 : 1 }' \
+      || fail "EXIF orientation $tag has the intended $format pixels, including mirroring" "$error"
+    profiles=$(magick identify -quiet -format '%[profiles]' "$output[0]")
+    orientation=$(magick identify -format '%[orientation]' "$output[0]")
+    [[ -z $profiles && ( $orientation == "Undefined" || $orientation == "TopLeft" ) ]] \
+      || fail "the $format export needs no source metadata to display correctly" "$profiles $orientation"
+    if (( tag == 0 )) && [[ $format == "jpg" ]]; then
+      magick "$input" -resize '64x64>' -quality 85 -strip "$test_tmp/orientation-control.jpg"
+      cmp -s "$output" "$test_tmp/orientation-control.jpg" || fail "untagged JPG output stays byte-identical"
+    fi
+  done
+  [[ $(sha256sum "$input") == "$before" ]] || fail "orientation normalization leaves the camera original untouched"
+done
+pass "rotated, mirrored, normal and untagged photos export correctly without metadata or source changes"
+
 # A 640x360 two-frame animated gif, a static gif, and a 128x128 two-frame
 # transparent gif (a transparent index, so the alpha check fires).
 magick -size 640x360 xc:red -fill blue -draw "circle 320,180 320,80" "$test_tmp/a1.png"
