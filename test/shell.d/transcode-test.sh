@@ -77,6 +77,151 @@ run_transcode "$test_tmp/alpha.gif" avif 128 >"$test_tmp/t4.log" 2>&1 || fail "a
 [[ -e $test_tmp/alpha-128.avif ]] || fail "the transparent gif's avif is written"
 pass "a transparent gif encodes to avif at a picked rung"
 
+# WebM advertises alpha in its container even when ffprobe's native decoder
+# reports yuv420p. A CPU re-encode must restore that plane, not just stamp a
+# fresh alpha_mode tag over opaque pixels.
+run_transcode "$test_tmp/alpha.gif" webm '' 128 cpu >"$test_tmp/webm-alpha.log" 2>&1 \
+  || fail "the transparent WebM fixture encodes" "$(cat "$test_tmp/webm-alpha.log")"
+run_transcode "$test_tmp/alpha-128.webm" webm '' 64 cpu >"$test_tmp/webm-resize.log" 2>&1 \
+  || fail "transparent WebM resizes on CPU" "$(cat "$test_tmp/webm-resize.log")"
+ffmpeg -v error -y -c:v libvpx-vp9 -i "$test_tmp/alpha-128-64.webm" -frames:v 1 \
+  -vf alphaextract "$test_tmp/webm-alpha.png"
+mean=$(magick "$test_tmp/webm-alpha.png" -format '%[fx:mean]' info:)
+awk -v a="$mean" 'BEGIN { exit (a >= 0 && a < 0.9) ? 0 : 1 }' \
+  || fail "transparent WebM retains its alpha pixels when resized" "$mean"
+pass "transparent WebM is decoded with its alpha plane before a CPU resize"
+
+# Numeric video rungs are long-edge sizes in both orientations; the top
+# menu entry is native, not the height of a landscape recording. Keep the
+# explicit legacy height aliases working without advertising them as rungs.
+for dims in 642x362 362x642; do
+  ffmpeg -v error -y -f lavfi -i "color=c=red:s=$dims:r=2:d=1" -c:v libx264 "$test_tmp/$dims.mp4"
+  : >"$menu_log"
+  printf '0\n' >"$test_tmp/menu-count"
+  run_transcode "$test_tmp/$dims.mp4" >"$test_tmp/ladder-$dims.log" 2>&1 \
+    || fail "a video resolution rung converts $dims" "$(cat "$test_tmp/ladder-$dims.log")"
+  grep -q '^Select resolution 642 640 540 512 480 360 256 128$' "$menu_log" \
+    || fail "the video ladder is descending from the native long edge for $dims" "$(cat "$menu_log")"
+  out_dims=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$test_tmp/$dims-360.mp4")
+  if [[ $dims == "642x362" ]]; then expected=360,202; else expected=202,360; fi
+  [[ $out_dims == "$expected" ]] || fail "the numeric rung bounds the long edge for $dims" "$out_dims"
+  run_transcode "$test_tmp/$dims.mp4" mp4 '' 720p cpu >"$test_tmp/legacy-$dims.log" 2>&1 \
+    || fail "an explicit legacy video height works for $dims" "$(cat "$test_tmp/legacy-$dims.log")"
+  height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$test_tmp/$dims-720p.mp4")
+  [[ $height == 720 ]] || fail "the legacy 720p argument remains an explicit height for $dims" "$height"
+done
+pass "landscape and portrait video ladders use the long edge, while explicit legacy heights still work"
+
+# Four real still-image routes: AVIF/WebP -> AVIF/WebP. Compare decoded alpha
+# pixels after an arbitrary resize, not just the presence of an alpha tag.
+require_command avifenc
+require_command cwebp
+magick -size 192x256 xc:none -fill '#ff000080' -draw 'rectangle 32,32 95,223' \
+  -fill red -draw 'rectangle 96,32 159,223' "$test_tmp/still.png"
+avifenc --codec aom --yuv 444 --min 20 --max 20 --qalpha 100 "$test_tmp/still.png" "$test_tmp/still.avif" >"$test_tmp/still-avif.log" 2>&1
+cwebp -q 90 -alpha_q 100 -m 6 "$test_tmp/still.png" -o "$test_tmp/still.webp" >"$test_tmp/still-webp.log" 2>&1
+for input_format in avif webp; do
+  magick "$test_tmp/still.$input_format[0]" -resize '128x128>' -alpha extract "$test_tmp/expected-alpha.png"
+  for output_format in avif webp; do
+    # Separate input stems prevent a same-format run from replacing a fixture.
+    cp "$test_tmp/still.$input_format" "$test_tmp/from-$input_format.$input_format"
+    run_transcode "$test_tmp/from-$input_format.$input_format" "$output_format" high 128 cpu \
+      >"$test_tmp/alpha-$input_format-$output_format.log" 2>&1 \
+      || fail "still $input_format -> $output_format resizes" "$(cat "$test_tmp/alpha-$input_format-$output_format.log")"
+    output="$test_tmp/from-$input_format-128-high.$output_format"
+    dims=$(magick identify -format '%w %h' "$output[0]")
+    [[ $dims == "96 128" ]] || fail "still $input_format -> $output_format respects the portrait long edge" "$dims"
+    magick "$output[0]" -alpha extract "$test_tmp/actual-alpha.png"
+    error=$(magick compare -metric RMSE "$test_tmp/expected-alpha.png" "$test_tmp/actual-alpha.png" null: 2>&1 || true)
+    error=$(awk -F '[()]' '{ print $2 }' <<<"$error")
+    awk -v e="$error" 'BEGIN { exit (e != "" && e + 0 <= 0.004) ? 0 : 1 }' \
+      || fail "still $input_format -> $output_format preserves transparent and semitransparent pixels" "$error"
+    pass "still $input_format -> $output_format preserves alpha pixels at an arbitrary portrait resize"
+  done
+done
+
+# Hardware is a protocol fixture here, not a claim to have these GPUs in CI.
+# Run the real vendor/node selection and gates; only ffmpeg's hardware
+# inventory/probe is stubbed. Ordinary CPU encodes still use real ffmpeg.
+(
+  source "$ROOT/bin/omarchy-transcode"
+  export OMARCHY_PCI_DEVICES_PATH="$test_tmp/pci"
+  export OMARCHY_DRM_PATH="$test_tmp/drm" OMARCHY_DRI_PATH="$test_tmp/dri"
+  mkdir -p "$OMARCHY_PCI_DEVICES_PATH/gpu" "$OMARCHY_DRM_PATH/renderD129/device/driver" "$OMARCHY_DRI_PATH"
+  printf '0x030000\n' >"$OMARCHY_PCI_DEVICES_PATH/gpu/class"
+  printf '0x10de\n' >"$OMARCHY_PCI_DEVICES_PATH/gpu/vendor"
+  gpu_log="$test_tmp/gpu.log"
+  inventory=av1_nvenc probe_failure=""
+  ffmpeg() {
+    printf '%s\n' "$*" >>"$gpu_log"
+    if [[ $* == *-encoders* ]]; then
+      printf '%s\n' "$inventory"
+    elif [[ $* == *testsrc=* ]]; then
+      if [[ $probe_failure == "memory" ]]; then
+        echo CUDA_ERROR_OUT_OF_MEMORY >&2
+        return 1
+      elif [[ $probe_failure == "qsv" && $* == *av1_qsv* ]]; then
+        echo 'Error initializing an MFX session' >&2
+        return 1
+      fi
+    else
+      command ffmpeg "$@"
+    fi
+  }
+  omarchy-pkg-missing() { return 1; }
+  : >"$gpu_log"
+  gpu_av1_for_input "$test_tmp/alpha.gif" 128
+  [[ -z $gpu_enc && ! -s $gpu_log ]] || fail "alpha is gated before hardware discovery or probing"
+  gpu_av1_for_input "$test_tmp/alpha-128.webm" 128
+  [[ -z $gpu_enc && ! -s $gpu_log ]] || fail "WebM alpha metadata also gates hardware before probing"
+  inventory=""
+  gpu_av1_for_input "$test_tmp/anim.gif" 360
+  [[ -z $gpu_enc ]] && ! grep -q testsrc "$gpu_log" || fail "missing hardware encoder support skips the live probe"
+  inventory=av1_nvenc
+  : >"$gpu_log"
+  gpu_av1_for_input "$test_tmp/static.gif" 360
+  [[ -z $gpu_enc ]] && ! grep -q testsrc "$gpu_log" || fail "a single frame skips the live GPU probe"
+  : >"$gpu_log"
+  gpu_av1_for_input "$test_tmp/anim.gif" 128
+  [[ -z $gpu_enc ]] && ! grep -q testsrc "$gpu_log" || fail "a sub-minimum NVIDIA target stays native on CPU"
+  probe_failure=memory
+  gpu_av1_for_input "$test_tmp/anim.gif" 360 2>"$test_tmp/gpu-memory.log"
+  [[ -z $gpu_enc ]] && grep -q 'Not enough GPU memory' "$test_tmp/gpu-memory.log" \
+    || fail "a VRAM probe failure is diagnosed and selects CPU"
+  probe_failure=""
+  : >"$gpu_log"
+  main "$test_tmp/anim.gif" webm '' 360 cpu >"$test_tmp/gpu-explicit-cpu.log" 2>&1 \
+    || fail "explicit CPU encodes without hardware probes" "$(cat "$test_tmp/gpu-explicit-cpu.log")"
+  ! grep -Eq -- '-encoders|testsrc' "$gpu_log" || fail "explicit CPU never probes GPU"
+  cp "$test_tmp/anim.gif" "$test_tmp/choice.gif"
+  omarchy-menu-select() { echo cpu; }
+  : >"$gpu_log"
+  main "$test_tmp/choice.gif" webm '' 360 >"$test_tmp/gpu-declined.log" 2>&1 \
+    || fail "CPU can be chosen after a successful GPU probe" "$(cat "$test_tmp/gpu-declined.log")"
+  grep -q testsrc=s=360x202 "$gpu_log" && grep -q -- '-c:v libvpx-vp9' "$gpu_log" \
+    || fail "the probe uses the target dimensions and a CPU choice remains CPU" "$(cat "$gpu_log")"
+  pass "AVIF/WebM hardware gates preserve alpha, skip stills and unsupported targets, diagnose VRAM, and honor CPU"
+
+  printf '0x1002\n' >"$OMARCHY_PCI_DEVICES_PATH/gpu/vendor"
+  printf '0x1002\n' >"$OMARCHY_DRM_PATH/renderD129/device/vendor"
+  : >"$OMARCHY_DRI_PATH/renderD129"
+  inventory='av1_vaapi av1_amf'
+  gpu_av1_for_input "$test_tmp/anim.gif" 360
+  [[ $gpu_enc == "av1_vaapi" && ${gpu_device[*]} == "-vaapi_device $OMARCHY_DRI_PATH/renderD129" \
+    && $gpu_upload == "format=nv12,hwupload" && $gpu_pix == "vaapi" ]] \
+    || fail "AMD uses its own render node and the VA-API upload path"
+  printf '0x8086\n' >"$OMARCHY_PCI_DEVICES_PATH/gpu/vendor"
+  printf '0x8086\n' >"$OMARCHY_DRM_PATH/renderD129/device/vendor"
+  inventory='av1_qsv av1_vaapi'
+  gpu_av1_for_input "$test_tmp/anim.gif" 360
+  [[ $gpu_enc == "av1_qsv" && ${gpu_device[*]} == "-qsv_device $OMARCHY_DRI_PATH/renderD129" ]] \
+    || fail "Intel QSV is probed on the Intel render node"
+  probe_failure=qsv
+  gpu_av1_for_input "$test_tmp/anim.gif" 360
+  [[ $gpu_enc == "av1_vaapi" ]] || fail "Intel can use VA-API when QSV is unusable"
+  pass "AMD VA-API and Intel QSV/VA-API use vendor-matched driver-backed render nodes"
+)
+
 # --- avif timing regression ------------------------------------------------
 # The ffprobe avif demuxer only exposes the first frame, so the timing
 # probe reads the container duration from ffprobe and the frame count plus

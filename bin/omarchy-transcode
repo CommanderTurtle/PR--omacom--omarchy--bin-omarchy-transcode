@@ -15,8 +15,8 @@ Usage:
 
 With no input, pick a picture or video from ~/Pictures and ~/Videos,
 or only from --path when provided. Then pick one of two split paths:
-Codec (format, and quality for pictures) or Resolution (ladder rungs for
-pictures, 4k/1080p/720p for videos). The paths never intersect: Resolution
+Codec (format, and quality for pictures) or Resolution (descending long-edge
+ladder rungs). The paths never intersect: Resolution
 resizes in the input's format, Codec re-encodes at native size.
 
 Options:
@@ -38,8 +38,9 @@ Quality:
   Pictures: high, medium, low (ignored for png)
 
 Resolutions:
-  Pictures: a pixel width such as 5120 (high, medium, low = 3160, 2160, 1080)
-  Videos: 4k, 1080p, 720p
+  Pictures and videos: a long-edge pixel size such as 5120, without upscaling
+  Legacy CLI aliases: picture high/medium/low = 3160/2160/1080;
+  video 4k/1080p/720p remain explicit height-based targets, never menu choices
 EOF
 }
 
@@ -98,6 +99,12 @@ media_type() {
 # alpha-carrying.
 input_has_alpha() {
   local pix a
+  if [[ $(file -b --mime-type -- "$1" 2>/dev/null) == "video/webm" ]]; then
+    # The native VP9 decoder reports yuv420p even for WebM with alpha.
+    a=$(ffprobe -v error -select_streams v:0 -show_entries stream_tags=alpha_mode \
+      -of default=noprint_wrappers=1:nokey=1 -- "$1" 2>/dev/null) || a=""
+    [[ $a == 1 ]] && return 0
+  fi
   if [[ $(file -b --mime-type -- "$1" 2>/dev/null) == "image/gif" ]]; then
     a=$(magick identify -format '%A' -- "$1[0]" 2>/dev/null)
     [[ $a != "Undefined" && $a != "Opaque" ]]
@@ -108,13 +115,13 @@ input_has_alpha() {
     # A here-string, not a pipe: grep -q would otherwise SIGPIPE ffprobe.
     pix=$(ffprobe -v error -select_streams v -show_entries stream=pix_fmt \
       -of default=noprint_wrappers=1:nokey=1 -- "$1" 2>/dev/null)
-    grep -qx gray <<<"$pix"
+    grep -Eq '^gray([0-9]+(le|be)?)?$' <<<"$pix"
     return
   fi
   pix=$(ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt \
     -of default=noprint_wrappers=1:nokey=1 -- "$1" 2>/dev/null) || return 1
   case "$pix" in
-  yuva* | rgba | bgra | gbrap* | pal8a) return 0 ;;
+  yuva* | rgba* | bgra* | argb | abgr | gbrap* | ya* | pal8a) return 0 ;;
   pal8)
     a=$(magick identify -format '%A' -- "$1[0]" 2>/dev/null)
     [[ $a != "Undefined" && $a != "Opaque" ]]
@@ -153,43 +160,144 @@ gpu_available() {
   vendor=$(gpu_vendor)
   case "$vendor" in
   nvidia) enc=av1_nvenc ;;
-  amd) enc=av1_amf ;;
-  intel) enc=av1_qsv ;;
+  amd) enc='av1_(vaapi|amf)' ;;
+  intel) enc='av1_(qsv|vaapi)' ;;
   *) return 1 ;;
   esac
   # A here-string, not a pipe: grep -q exits on first match and would
   # otherwise SIGPIPE ffmpeg (141) under pipefail.
-  encs=$(ffmpeg -hide_banner -encoders 2>/dev/null)
-  grep -qw "$enc" <<<"$encs"
+  encs=$(ffmpeg -hide_banner -encoders 2>/dev/null) || return 1
+  grep -Eqw "$enc" <<<"$encs"
+}
+
+# Resolve the render node belonging to this vendor, not the first GPU on a
+# hybrid machine. A render node without its kernel driver is not usable.
+gpu_render_node() {
+  local vendor="$1" device id
+  case "$vendor" in
+  amd) id=0x1002 ;;
+  intel) id=0x8086 ;;
+  *) return 1 ;;
+  esac
+  for device in "${OMARCHY_DRM_PATH:-/sys/class/drm}"/renderD*; do
+    [[ -r $device/device/vendor && -e $device/device/driver ]] || continue
+    [[ $(< "$device/device/vendor") == "$id" ]] || continue
+    local node="${OMARCHY_DRI_PATH:-/dev/dri}/${device##*/}"
+    if [[ -r $node && -w $node ]]; then
+      printf '%s' "$node"
+      return 0
+    fi
+  done
+  return 1
 }
 
 # Set gpu_enc/gpu_flags to a working hardware AV1 encoder for the detected
 # vendor, probed with a real encode; empty when the encoder is unusable.
 gpu_av1_setup() {
-  gpu_enc="" gpu_flags=""
-  local vendor
+  gpu_enc="" gpu_flags="" gpu_upload="" gpu_pix=yuv420p
+  gpu_device=()
+  local vendor enc node="" error="" encs pkg
+  local -a candidates=() probe_filter=()
   vendor=$(gpu_vendor)
   case "$vendor" in
-  nvidia)
-    gpu_enc="av1_nvenc"
-    gpu_flags="-preset p6 -tune hq -rc vbr -cq 17 -b:v 0"
-    ;;
-  amd)
-    gpu_enc="av1_amf"
-    gpu_flags="-quality 17"
-    ;;
-  intel)
-    gpu_enc="av1_qsv"
-    gpu_flags="-global_quality 17"
-    ;;
-  *)
-    return 0
-    ;;
+  nvidia) candidates=(av1_nvenc) ;;
+  amd) candidates=(av1_vaapi av1_amf) ;;
+  intel) candidates=(av1_qsv av1_vaapi) ;;
+  *) return 0 ;;
   esac
-  # The encoder may be compiled in but unusable on this silicon; probe once.
-  ffmpeg -v error -f lavfi -i testsrc=s=256x144:d=0.04 \
-    -c:v "$gpu_enc" $gpu_flags -pix_fmt yuv420p -f null - 2>/dev/null \
-    || { gpu_enc=""; gpu_flags=""; }
+  [[ $vendor == "nvidia" ]] || node=$(gpu_render_node "$vendor") || node=""
+  encs=$(ffmpeg -hide_banner -encoders 2>/dev/null) || encs=""
+  for enc in "${candidates[@]}"; do
+    grep -qw "$enc" <<<"$encs" || continue
+    gpu_device=() probe_filter=() gpu_upload="" gpu_pix=yuv420p
+    case "$enc" in
+    av1_nvenc) gpu_flags="-preset p6 -tune hq -rc vbr -cq 17 -b:v 0" ;;
+    av1_amf) gpu_flags="-quality quality -rc cqp -qp_i 17 -qp_p 17" ;;
+    av1_qsv)
+      [[ -n $node ]] || continue
+      gpu_device=(-qsv_device "$node")
+      gpu_flags="-global_quality 17"
+      ;;
+    av1_vaapi)
+      [[ -n $node ]] || continue
+      gpu_device=(-vaapi_device "$node")
+      gpu_flags="-qp 17"
+      gpu_upload='format=nv12,hwupload'
+      gpu_pix=vaapi
+      probe_filter=(-vf "$gpu_upload")
+      ;;
+    esac
+    # This checks the actual userspace driver and encoder, not just PCI or
+    # compiled-in support. Preserve the NVIDIA encoder settings.
+    if error=$(ffmpeg -v error "${gpu_device[@]}" -f lavfi -i "testsrc=s=${1:-256x144}:d=0.04" \
+      "${probe_filter[@]}" -c:v "$enc" $gpu_flags -pix_fmt "$gpu_pix" -f null - 2>&1); then
+      gpu_enc=$enc
+      return 0
+    fi
+  done
+  gpu_enc="" gpu_flags="" gpu_upload="" gpu_device=()
+  if grep -Eiq 'out of memory|not enough (memory|VRAM)|cannot allocate memory|CUDA_ERROR_OUT_OF_MEMORY|AMF_OUT_OF_MEMORY' <<<"$error"; then
+    echo "Not enough GPU memory for hardware AV1; using cpu" >&2
+  else
+    echo "Hardware AV1 unavailable: check the $vendor driver, render-node access, and AV1 encode support; using cpu" >&2
+    case "$vendor" in
+    nvidia) candidates=(nvidia-utils) ;;
+    amd) candidates=(mesa) ;;
+    intel) candidates=(intel-media-driver vpl-gpu-rt) ;;
+    esac
+    for pkg in "${candidates[@]}"; do
+      if omarchy-pkg-missing "$pkg"; then
+        echo "$pkg is not installed. Install it with: sudo pacman -S $pkg" >&2
+      fi
+    done
+  fi
+  [[ -z $error ]] || printf '%s\n' "$error" >&2
+  return 0
+}
+
+# AVIF/WebM only: alpha first, compiled hardware support second, animation
+# third, then a live driver/memory probe. Only a successful result is offered
+# in the engine picker; explicit cpu never runs these probes.
+gpu_av1_for_input() {
+  gpu_checked=1
+  gpu_enc="" gpu_flags="" gpu_upload="" gpu_device=()
+  input_has_alpha "$1" && return 0
+  gpu_available || return 0
+  local frames mime dims w h edge="${2:-}"
+  mime=$(file -b --mime-type -- "$1")
+  if [[ $mime == image/* ]]; then
+    frames=$(picture_frames "$1")
+  else
+    frames=$(ffprobe -v error -select_streams v:0 -read_intervals '%+#2' -count_frames \
+      -show_entries stream=nb_read_frames -of default=noprint_wrappers=1:nokey=1 -- "$1" 2>/dev/null) || frames=""
+  fi
+  [[ $frames =~ ^[0-9]+$ ]] && (( frames > 1 )) || return 0
+  dims=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 -- "$1" 2>/dev/null) || return 0
+  IFS=, read -r w h <<<"$dims"
+  [[ $w =~ ^[0-9]+$ && $h =~ ^[0-9]+$ ]] && (( w > 0 && h > 0 )) || return 0
+  case "$edge" in
+  4k) edge=2160 ;;
+  1080p) edge=1080 ;;
+  720p) edge=720 ;;
+  esac
+  if [[ -n $edge ]]; then
+    if [[ ${2:-} == *p || ${2:-} == "4k" ]]; then
+      w=$(( w * edge / h )) h=$edge
+    elif (( w >= h )); then
+      edge=$(( edge < w ? edge : w ))
+      h=$(( h * edge / w )) w=$edge
+    else
+      edge=$(( edge < h ? edge : h ))
+      w=$(( w * edge / h )) h=$edge
+    fi
+  fi
+  w=$(( w / 2 * 2 )) h=$(( h / 2 * 2 ))
+  if [[ $(gpu_vendor) == "nvidia" ]] && (( w < 256 || h < 144 )); then
+    return 0
+  fi
+  # Probe the requested dimensions too: a tiny encode cannot establish that
+  # enough memory is available for the actual target. Never upscale to fit.
+  (( w > 0 && h > 0 )) && gpu_av1_setup "${w}x${h}"
   return 0
 }
 
@@ -275,7 +383,9 @@ transcode_picture() {
     local tmp
     tmp=$(mktemp --suffix=.png)
     trap 'rm -f "$tmp" 2>/dev/null; trap - RETURN' RETURN
-    ffmpeg -i "$input" -frames:v 1 -vf "scale='if(gte(iw,ih),min(${max},iw),-1)':'if(gte(iw,ih),-1,min(${max},ih))'" "$tmp" -y
+    # ImageMagick combines AVIF's auxiliary alpha with its color image;
+    # ffmpeg's default stream selection decodes only the color plane.
+    magick "$input[0]" -resize "$resize" -type TrueColorAlpha -define png:color-type=6 "$tmp"
     cwebp -q "$q" -alpha_q 100 -m 6 "$tmp" -o "$output"
     rm -f "$tmp"
     ;;
@@ -309,7 +419,7 @@ transcode_picture() {
     local tmp
     tmp=$(mktemp --suffix=.png)
     trap 'rm -f "$tmp" 2>/dev/null; trap - RETURN' RETURN
-    ffmpeg -i "$input" -frames:v 1 -vf "scale='if(gte(iw,ih),min(${max},iw),-1)':'if(gte(iw,ih),-1,min(${max},ih))'" "$tmp" -y
+    magick "$input[0]" -resize "$resize" -type TrueColorAlpha -define png:color-type=6 "$tmp"
     avifenc --codec aom --yuv 444 --min "$q" --max "$q" --qalpha 100 "$tmp" "$output"
     rm -f "$tmp"
     ;;
@@ -343,12 +453,9 @@ transcode_video() {
     return 1
     ;;
   *)
-    if [[ $(file -b --mime-type -- "$input") == "image/gif" ]]; then
-      # Gif rungs mean the longest side, matching the picture path.
-      scale="scale='if(gte(iw,ih),min($resolution,iw),-2)':'if(gte(iw,ih),-2,min($resolution,ih))'"
-    else
-      scale="scale=-2:$resolution"
-    fi
+    # Every numeric rung has the same longest-side meaning, regardless of
+    # orientation or container. Named legacy aliases above remain heights.
+    scale="scale='if(gte(iw,ih),min($resolution,iw),-2)':'if(gte(iw,ih),-2,min($resolution,ih))'"
     ;;
   esac
 
@@ -383,9 +490,19 @@ transcode_video() {
   local vfr="-fps_mode passthrough"
   local alpha=0
   input_has_alpha "$input" && alpha=1
-  if [[ $engine == "gpu" ]]; then
+  if (( alpha )) && [[ $(file -b --mime-type -- "$input") == "video/webm" ]]; then
+    # libvpx restores the alpha plane that the native VP9 decoder omits.
+    local codec
+    codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
+      -of default=noprint_wrappers=1:nokey=1 -- "$input" 2>/dev/null)
+    case "$codec" in
+    vp9) src_in=(-c:v libvpx-vp9 -i "$input") ;;
+    vp8) src_in=(-c:v libvpx -i "$input") ;;
+    esac
+  fi
+  if [[ $engine == "gpu" && ( $format == "avif" || $format == "webm" ) ]]; then
     # Reuse the probe main() ran for the engine ask; probe once.
-    [[ -n ${gpu_enc:-} ]] || gpu_av1_setup
+    [[ ${gpu_checked:-0} == 1 ]] || gpu_av1_for_input "$input" "$resolution"
   else
     gpu_enc="" gpu_flags=""
   fi
@@ -393,7 +510,7 @@ transcode_video() {
   # alpha input but encodes yuv420p), and the gif scale pipeline forces
   # yuv420p before the palette — so alpha inputs take the cpu path, the
   # same no-exceptions rule the avif output already uses.
-  if (( alpha )) && [[ -n $gpu_enc ]]; then
+  if (( alpha )); then
     gpu_enc="" gpu_flags=""
     [[ $format == "gif" ]] && engine=cpu
   fi
@@ -414,14 +531,14 @@ transcode_video() {
         tw=""
       fi
     elif [[ $scale == *'if(gte(iw,ih)'* ]]; then
-      # Longest-side target (gif rungs): derive w/h from the aspect.
+      # Longest-side target: derive w/h from the aspect, without upscaling.
       if [[ $iw =~ ^[0-9]+$ && $ih =~ ^[0-9]+$ && $resolution =~ ^[0-9]+$ ]] && (( iw > 0 && ih > 0 )); then
         if (( iw >= ih )); then
-          tw=$resolution
-          th=$(( (resolution * ih) / iw ))
+          tw=$(( resolution < iw ? resolution : iw ))
+          th=$(( (tw * ih) / iw ))
         else
-          th=$resolution
-          tw=$(( (resolution * iw) / ih ))
+          th=$(( resolution < ih ? resolution : ih ))
+          tw=$(( (th * iw) / ih ))
         fi
         (( tw % 2 )) && tw=$(( tw - 1 ))
         (( th % 2 )) && th=$(( th - 1 ))
@@ -431,12 +548,20 @@ transcode_video() {
     else
       tw=$iw th=$ih
     fi
-    if [[ $tw =~ ^[0-9]+$ && $th =~ ^[0-9]+$ ]] && (( tw >= 256 && th >= 144 )); then
+    if [[ $tw =~ ^[0-9]+$ && $th =~ ^[0-9]+$ ]] && (( tw > 0 && th > 0 )) \
+      && { [[ $gpu_enc != "av1_nvenc" ]] || (( tw >= 256 && th >= 144 )); }; then
       local minscale='scale=w=trunc(iw*max(1\,max(256/iw\,144/ih))/2)*2:h=trunc(ih*max(1\,max(256/iw\,144/ih))/2)*2'
-      if [[ -n $vf ]]; then
-        hwvf="-vf ${vf#-vf },$minscale"
+      hwvf=$vf
+      if [[ $gpu_enc == "av1_nvenc" ]]; then
+        if [[ -n $vf ]]; then
+          hwvf="-vf ${vf#-vf },$minscale"
+        else
+          hwvf="-vf $minscale"
+        fi
+      elif [[ -n $gpu_upload ]]; then
+        hwvf="-vf ${vf:+${vf#-vf },}$gpu_upload"
       else
-        hwvf="-vf $minscale"
+        hwvf=$vf
       fi
     else
       gpu_enc="" gpu_flags=""
@@ -527,7 +652,7 @@ transcode_video() {
     ;;
   avif)
     if [[ -n $gpu_enc ]]; then
-      ffmpeg "${src_in[@]}" $hwvf $vfr -an -c:v "$gpu_enc" $gpu_flags -pix_fmt yuv420p -loop 0 -f avif "$output"
+      ffmpeg "${gpu_device[@]}" "${src_in[@]}" $hwvf $vfr -an -c:v "$gpu_enc" $gpu_flags -pix_fmt "$gpu_pix" -loop 0 -f avif "$output"
     elif (( alpha )); then
       # The ffmpeg avif muxer drops the alpha auxiliary, so alpha-carrying
       # input is encoded by magick (libheif) — the same encoder the picture
@@ -546,7 +671,7 @@ transcode_video() {
     ;;
   webm)
     if [[ -n $gpu_enc ]]; then
-      ffmpeg "${src_in[@]}" $hwvf $vfr -c:v "$gpu_enc" $gpu_flags -pix_fmt yuv420p -c:a libopus -b:a 128k -f webm "$output"
+      ffmpeg "${gpu_device[@]}" "${src_in[@]}" $hwvf $vfr -c:v "$gpu_enc" $gpu_flags -pix_fmt "$gpu_pix" -c:a libopus -b:a 128k -f webm "$output"
     else
       local wpix=yuv420p
       (( alpha )) && wpix=yuva420p
@@ -573,6 +698,8 @@ copy_to_clipboard() {
 
 main() {
   local input="" format="" quality="" resolution="" search_path=""
+  local gpu_checked=0 gpu_enc="" gpu_flags="" gpu_upload="" gpu_pix=yuv420p
+  local -a gpu_device=()
   local type output stem positional=()
 
   while (( $# > 0 )); do
@@ -734,14 +861,9 @@ main() {
       else
         local -a vrungs=()
         local dims vh
-        if [[ $(file -b --mime-type -- "$input") == "image/gif" ]]; then
-          # Gif rungs mean the longest side, matching the picture path.
-          dims=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 -- "$input" 2>/dev/null) || dims=""
-          IFS=, read -r w h <<<"$dims"
-          vh=$(( ${w:-0} > ${h:-0} ? ${w:-0} : ${h:-0} ))
-        else
-          vh=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=noprint_wrappers=1:nokey=1 -- "$input" 2>/dev/null) || vh=""
-        fi
+        dims=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 -- "$input" 2>/dev/null) || dims=""
+        IFS=, read -r w h <<<"$dims"
+        vh=$(( ${w:-0} > ${h:-0} ? ${w:-0} : ${h:-0} ))
         if [[ $vh =~ ^[0-9]+$ ]] && (( vh > 0 )); then
           vrungs=("$vh")
           for r in 7168 6656 6144 5632 5120 4608 4096 3840 3584 3072 2560 2160 2048 1920 1440 1280 1080 1024 960 854 720 640 540 512 480 360 256 128; do
@@ -791,18 +913,8 @@ main() {
     engine=cpu
     if [[ $type == "video" ]]; then
       case "$format" in
-      avif)
-        # Alpha-carrying input keeps its alpha on the CPU path only; the
-        # rest ask for the hardware path when the probe passes.
-        if ! input_has_alpha "$input"; then
-          gpu_av1_setup
-          if [[ -n $gpu_enc ]]; then
-            engine=$(omarchy-menu-select "$(omarchy-i18n transcode.engine)" gpu cpu) || return 1
-          fi
-        fi
-        ;;
-      webm)
-        gpu_av1_setup
+      avif|webm)
+        gpu_av1_for_input "$input" "$resolution"
         if [[ -n $gpu_enc ]]; then
           engine=$(omarchy-menu-select "$(omarchy-i18n transcode.engine)" gpu cpu) || return 1
         fi
@@ -852,4 +964,6 @@ main() {
   fi
 }
 
-main "$@"
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi
