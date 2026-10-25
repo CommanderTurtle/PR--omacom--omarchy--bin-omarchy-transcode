@@ -112,6 +112,29 @@ for dims in 642x362 362x642; do
 done
 pass "landscape and portrait video ladders use the long edge, while explicit legacy heights still work"
 
+# Cropped VP9 can have odd dimensions. The native ladder rung is numeric,
+# unlike an empty native-size argument; both it and an explicit odd rung
+# must still produce MP4 dimensions compatible with 4:2:0, in either orientation.
+for dims in 1279x719 719x1279; do
+  ffmpeg -v error -y -f lavfi -i "testsrc=s=$dims:r=2:d=1" -c:v libvpx-vp9 \
+    -pix_fmt yuv420p -deadline realtime -cpu-used 8 "$test_tmp/odd-$dims.webm"
+  input_dims=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$test_tmp/odd-$dims.webm")
+  [[ $input_dims == "${dims/x/,}" ]] || fail "the cropped VP9 fixture really has odd dimensions" "$input_dims"
+  for rung in '' 1279 1277; do
+    run_transcode "$test_tmp/odd-$dims.webm" mp4 '' "$rung" cpu >"$test_tmp/odd-$dims-$rung.log" 2>&1 \
+      || fail "cropped VP9 converts to MP4 at ${rung:-native} for $dims" "$(cat "$test_tmp/odd-$dims-$rung.log")"
+    output="$test_tmp/odd-$dims${rung:+-$rung}.mp4"
+    actual=$(ffprobe -v error -select_streams v:0 -count_frames -show_entries stream=width,height,nb_read_frames -of csv=p=0 "$output")
+    if [[ $rung == "1277" ]]; then
+      if [[ $dims == "1279x719" ]]; then expected=1278,718,2; else expected=718,1278,2; fi
+    else
+      if [[ $dims == "1279x719" ]]; then expected=1280,720,2; else expected=720,1280,2; fi
+    fi
+    [[ $actual == "$expected" ]] || fail "MP4 rounds only the odd output edges and retains both frames" "$actual (expected $expected)"
+  done
+done
+pass "cropped VP9 converts to MP4 at native size, the native numeric rung and an odd CLI rung in both orientations"
+
 # Four real still-image routes: AVIF/WebP -> AVIF/WebP. Compare decoded alpha
 # pixels after an arbitrary resize, not just the presence of an alpha tag.
 require_command avifenc

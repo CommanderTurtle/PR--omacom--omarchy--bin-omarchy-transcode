@@ -462,7 +462,7 @@ transcode_video() {
   # Animated formats (gif/webm/avif) keep the source frame rate — never
   # framerate-compress by default — with a lanczos scale. mp4 keeps the
   # source frame rate and pads to even dimensions so libx264 accepts odd
-  # inputs.
+  # inputs, including an odd long edge left by a numeric rung.
   case "$format" in
   gif|webm|avif)
     if [[ -n $scale ]]; then
@@ -473,7 +473,7 @@ transcode_video() {
     ;;
   *)
     if [[ -n $scale ]]; then
-      vf="-vf $scale"
+      vf="-vf $scale,pad=ceil(iw/2)*2:ceil(ih/2)*2"
     else
       vf='-vf pad=ceil(iw/2)*2:ceil(ih/2)*2'
     fi
